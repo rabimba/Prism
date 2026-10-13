@@ -1,0 +1,23 @@
+# Rust / Cargo
+/target/
+**/target/
+
+# Vendor binaries & headers (fetched via ./scripts/fetch-vendor.sh and ./scripts/build-llama.sh)
+/Vendor/
+
+# Local Prism & legacy index files
+.prism.db
+.prism.db-wal
+.prism.db-shm
+.prism.vectors.f16
+.digup.db
+.digup.db-wal
+.digup.db-shm
+.digup.vectors.f16
+
+# OS / Editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+node_modules/

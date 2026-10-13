@@ -1,0 +1,36 @@
+[package]
+name = "prism-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prism-llama = { path = "../prism-llama" }
+prism-asr = { path = "../prism-asr" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+walkdir.workspace = true
+ignore.workspace = true
+unicode-normalization.workspace = true
+regex.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+sha2.workspace = true
+hex.workspace = true
+dirs.workspace = true
+tempfile.workspace = true
+chrono.workspace = true
+libc.workspace = true
+libloading.workspace = true
+globset.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true

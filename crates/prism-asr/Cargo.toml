@@ -1,0 +1,18 @@
+[package]
+name = "prism-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prism-llama = { path = "../prism-llama" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+hound.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
