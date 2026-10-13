@@ -79,7 +79,7 @@ impl Searcher {
             None
         };
 
-        let hits = self.rank_chunks(trimmed, query_vec.as_deref(), mode, filter)?;
+        let hits = self.rank_chunks(embedder, trimmed, query_vec.as_deref(), mode, filter)?;
         Ok(SearchResponse {
             query: trimmed.to_string(),
             mode,
@@ -134,6 +134,7 @@ impl Searcher {
         let mut probe_filter = filter.clone();
         probe_filter.limit = 8;
         let initial_hits = self.rank_chunks(
+            Some(embedder),
             &asr.effective_query(),
             Some(&asr.audio_embedding),
             SearchMode::Semantic,
@@ -205,6 +206,7 @@ impl Searcher {
         }
 
         let hits = self.rank_chunks(
+            Some(embedder),
             &effective_query,
             Some(&query_vec),
             SearchMode::Hybrid,
@@ -248,7 +250,13 @@ impl Searcher {
             SearchKind::Image => {
                 let (vec, _ahash) =
                     embedder.embed_image_path(input_path, ImageSizing::PHOTO_BUDGET)?;
-                let hits = self.rank_chunks(&file_name, Some(&vec), SearchMode::Semantic, filter)?;
+                let hits = self.rank_chunks(
+                    Some(embedder),
+                    &file_name,
+                    Some(&vec),
+                    SearchMode::Semantic,
+                    filter,
+                )?;
                 Ok(SearchResponse {
                     query: format!("[Image: {}]", file_name),
                     mode: SearchMode::Semantic,
@@ -262,7 +270,13 @@ impl Searcher {
                 let text = std::fs::read_to_string(input_path).unwrap_or_else(|_| file_name.clone());
                 let snippet: String = text.chars().take(600).collect();
                 let vec = embedder.embed_query(&snippet)?;
-                let hits = self.rank_chunks(&snippet, Some(&vec), SearchMode::Hybrid, filter)?;
+                let hits = self.rank_chunks(
+                    Some(embedder),
+                    &snippet,
+                    Some(&vec),
+                    SearchMode::Hybrid,
+                    filter,
+                )?;
                 Ok(SearchResponse {
                     query: format!("[File: {}]", file_name),
                     mode: SearchMode::Hybrid,
@@ -277,6 +291,7 @@ impl Searcher {
 
     fn rank_chunks(
         &self,
+        embedder: Option<&LlamaEmbedder>,
         query: &str,
         query_vec: Option<&[f32]>,
         mode: SearchMode,
@@ -309,24 +324,90 @@ impl Searcher {
             return Ok(Vec::new());
         }
 
-        // 1. Semantic scoring + Modality-Centered Z-score calibration
-        let (raw_scores, z_scores) = if let Some(qvec) = query_vec {
-            let slots: Vec<Option<usize>> = chunks.iter().map(|c| c.vector_slot).collect();
-            let raw = self.store.vectors.score_slots(qvec, &slots);
-            let modalities: Vec<ChunkModality> = chunks.iter().map(|c| c.modality).collect();
-            let sets_scale: Vec<bool> = chunks.iter().map(|c| c.sets_scale).collect();
-            let z = compute_modality_z_scores(&raw, &modalities, &sets_scale);
-            (raw, z)
-        } else {
-            (vec![0.0; chunks.len()], vec![0.0; chunks.len()])
-        };
-
-        // 2. Lexical FTS5 + token coverage scoring
+        // 1. Lexical FTS5 + token coverage scoring first so we can JIT-embed top unembedded lexical candidates
         let query_tokens = SearchText::fts_tokens(query);
         let fts_bm25 = if mode != SearchMode::Semantic && !query_tokens.is_empty() {
             self.store.query_fts_matches(query).unwrap_or_default()
         } else {
             HashMap::new()
+        };
+
+        let coverages: Vec<f64> = chunks
+            .iter()
+            .map(|c| {
+                if !filter.kinds.is_empty() && !filter.kinds.contains(&c.kind) {
+                    return 0.0;
+                }
+                compute_lexical_coverage(&query_tokens, c, fts_bm25.get(&c.chunk_id).copied())
+            })
+            .collect();
+
+        // 2. Semantic scoring + Just-In-Time (JIT) 768-D embedding for top unembedded OS candidates + Modality Z-scores
+        let mut has_vec_flags: Vec<bool> = chunks.iter().map(|c| c.vector_slot.is_some()).collect();
+        let (raw_scores, z_scores) = if let Some(qvec) = query_vec {
+            let slots: Vec<Option<usize>> = chunks.iter().map(|c| c.vector_slot).collect();
+            let mut raw = self.store.vectors.score_slots(qvec, &slots);
+            let mut modalities: Vec<ChunkModality> = chunks.iter().map(|c| c.modality).collect();
+            let mut sets_scale: Vec<bool> = chunks.iter().map(|c| c.sets_scale).collect();
+
+            // Apply cached JIT vectors first, then embed up to 6 uncached top lexical candidates
+            static JIT_VEC_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<i64, Vec<f32>>>> =
+                std::sync::OnceLock::new();
+            let cache_mutex = JIT_VEC_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+            if let Ok(cache) = cache_mutex.lock() {
+                for (i, c) in chunks.iter().enumerate() {
+                    if !has_vec_flags[i] {
+                        if let Some(cached_vec) = cache.get(&c.chunk_id) {
+                            raw[i] = prism_llama::cosine_similarity(qvec, cached_vec);
+                            has_vec_flags[i] = true;
+                            sets_scale[i] = true;
+                            modalities[i] = ChunkModality::Text;
+                        }
+                    }
+                }
+            }
+
+            if let Some(emb) = embedder {
+                let mut jit_candidates: Vec<usize> = (0..chunks.len())
+                    .filter(|&i| !has_vec_flags[i] && coverages[i] > 0.0)
+                    .collect();
+                jit_candidates.sort_by(|&a, &b| {
+                    coverages[b]
+                        .partial_cmp(&coverages[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| chunks[b].modified_unix.cmp(&chunks[a].modified_unix))
+                });
+                jit_candidates.truncate(6);
+
+                if !jit_candidates.is_empty() {
+                    let jit_texts: Vec<String> = jit_candidates
+                        .iter()
+                        .map(|&idx| {
+                            let c = chunks[idx];
+                            let snippet: String = c.text_content.chars().take(280).collect();
+                            LlamaEmbedder::document_prompt(&snippet, Some(c.file_name.as_str()))
+                        })
+                        .collect();
+                    if let Ok(vecs) = emb.embed_texts(&jit_texts) {
+                        let mut cache_guard = cache_mutex.lock().ok();
+                        for (&idx, doc_vec) in jit_candidates.iter().zip(vecs.into_iter()) {
+                            raw[idx] = prism_llama::cosine_similarity(qvec, &doc_vec);
+                            has_vec_flags[idx] = true;
+                            sets_scale[idx] = true;
+                            modalities[idx] = ChunkModality::Text;
+                            if let Some(ref mut cg) = cache_guard {
+                                cg.insert(chunks[idx].chunk_id, doc_vec);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let z = compute_modality_z_scores(&raw, &modalities, &sets_scale);
+            (raw, z)
+        } else {
+            (vec![0.0; chunks.len()], vec![0.0; chunks.len()])
         };
 
         let kind_hints = detect_kind_hints(&query_tokens);
@@ -337,6 +418,11 @@ impl Searcher {
             SearchMode::Hybrid => (1.0, 2.4),
         };
 
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         // Deduplicate by file_id (keep highest-scoring chunk per file)
         let mut best_by_file: HashMap<i64, SearchHit> = HashMap::new();
 
@@ -345,18 +431,17 @@ impl Searcher {
                 continue;
             }
 
-            let has_vec = chunk.vector_slot.is_some();
+            let has_vec = has_vec_flags[i];
             let z = if has_vec { z_scores[i] } else { 0.0 };
             let raw_cos = if has_vec { raw_scores[i] as f64 } else { 0.0 };
-            let coverage = compute_lexical_coverage(
-                &query_tokens,
-                chunk,
-                fts_bm25.get(&chunk.chunk_id).copied(),
-            );
+            let coverage = coverages[i];
 
             // DigUp Searcher.swift qualification gate:
             // A candidate only qualifies if it matches lexically (`coverage > 0`) OR stands out semantically above `zGate`.
-            let semantic_standout = has_vec && ((z >= 1.55 && raw_cos >= 0.35) || raw_cos >= 0.78);
+            let semantic_standout = has_vec
+                && ((z >= 1.75 && raw_cos >= 0.65)
+                    || (z >= 2.20 && raw_cos >= 0.38)
+                    || raw_cos >= 0.78);
             let qualifies = match mode {
                 SearchMode::Lexical => coverage > 0.0,
                 SearchMode::Semantic => semantic_standout,
@@ -368,6 +453,8 @@ impl Searcher {
 
             let sem_contrib = if has_vec && (z >= 0.45 && raw_cos >= 0.28) {
                 meaning_weight * z.max(0.0)
+            } else if has_vec && coverage > 0.0 && raw_cos >= 0.35 {
+                meaning_weight * (raw_cos * 0.65)
             } else {
                 0.0
             };
@@ -378,7 +465,11 @@ impl Searcher {
                 0.0
             };
 
-            let score = sem_contrib + words_weight * coverage.powf(1.35) + hint_bonus;
+            // Ongoing activity recency boost: active/recently modified files rank higher when relevant
+            let recency_bonus = compute_recency_boost(chunk.modified_unix, now_unix);
+
+            let score =
+                sem_contrib + words_weight * coverage.powf(1.35) + hint_bonus + recency_bonus;
             if score <= 0.05 {
                 continue;
             }
@@ -389,6 +480,17 @@ impl Searcher {
                 .join(&chunk.relative_path)
                 .to_string_lossy()
                 .to_string();
+
+            let mut origin = chunk.origin.clone();
+            if matches!(chunk.kind, SearchKind::Text | SearchKind::Code) && !query_tokens.is_empty()
+            {
+                if let Some((ls, le)) =
+                    find_matching_line_range(&chunk.text_content, &query_tokens, origin.line_start)
+                {
+                    origin.line_start = Some(ls);
+                    origin.line_end = Some(le);
+                }
+            }
 
             let hit = SearchHit {
                 file_id: chunk.file_id,
@@ -403,7 +505,7 @@ impl Searcher {
                 raw_cosine: raw_cos,
                 lexical_coverage: coverage,
                 snippet: SearchText::snippet(&chunk.text_content, query, 180),
-                origin: chunk.origin.clone(),
+                origin,
                 modified_unix: chunk.modified_unix,
                 size_bytes: chunk.size_bytes,
             };
@@ -421,11 +523,58 @@ impl Searcher {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.modified_unix.cmp(&a.modified_unix))
         });
         let limit = if filter.limit == 0 { 20 } else { filter.limit };
         hits.truncate(limit);
         Ok(hits)
     }
+}
+
+fn compute_recency_boost(modified_unix: i64, now_unix: i64) -> f64 {
+    if modified_unix <= 0 || now_unix <= 0 {
+        return 0.0;
+    }
+    let age_secs = (now_unix - modified_unix).max(0);
+    if age_secs <= 3600 {
+        0.38 // Modified within the last hour
+    } else if age_secs <= 86_400 {
+        0.26 // Modified today
+    } else if age_secs <= 7 * 86_400 {
+        0.16 // Modified this week
+    } else if age_secs <= 30 * 86_400 {
+        0.08 // Modified this month
+    } else {
+        0.0
+    }
+}
+
+fn find_matching_line_range(
+    text: &str,
+    query_tokens: &[String],
+    base_line: Option<u32>,
+) -> Option<(u32, u32)> {
+    let base = base_line.unwrap_or(1).max(1);
+    let mut best_line_idx = None;
+    let mut best_matches = 0usize;
+
+    for (idx, line) in text.lines().enumerate() {
+        let norm = SearchText::normalized(line).to_lowercase();
+        let m = query_tokens
+            .iter()
+            .filter(|t| norm.contains(t.as_str()))
+            .count();
+        if m > best_matches {
+            best_matches = m;
+            best_line_idx = Some(idx as u32);
+        }
+    }
+
+    let center = best_line_idx?;
+    let total_lines = (text.lines().count() as u32).max(1);
+    let start = base + center;
+    let end = (start + 2).min(base + total_lines - 1);
+    Some((start, end.max(start)))
 }
 
 fn compute_lexical_coverage(

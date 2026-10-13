@@ -8,12 +8,15 @@
 </head>
 <body>
   <div class="window-shell" id="dropZone">
-    <!-- Unified Header (matches DigUp SearchWindow.swift + SearchPanel.swift) -->
+    <!-- Clean macOS Spotlight / DigUp Unified Header -->
     <header class="unified-header">
       <div class="search-row">
-        <div class="brand-badge" title="Prism — Powered by EmbeddingGemma 2 (768-D)">
+        <div class="brand-badge" title="Prism — Ongoing Multimodal OS Search (EmbeddingGemma 2 768-D)">
           <div class="brand-orb"></div>
           <span class="brand-title">Prism</span>
+          <span class="live-badge" id="liveBadge" title="Ongoing filesystem watcher &amp; 768-D indexer active">
+            <span class="live-dot"></span>Live
+          </span>
         </div>
 
         <div class="search-field-wrap" id="searchFieldWrap">
@@ -23,21 +26,29 @@
             type="text"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Describe it: “quantum error correction”, “red square in video”, “code: sub-window”…"
+            placeholder="Search your computer — files, text, images, audio &amp; video…"
           />
+          <kbd class="search-shortcut-hint" id="shortcutHint">⌘K</kbd>
           <button id="clearQueryBtn" class="icon-btn clear-btn hidden" title="Clear search (Esc)">✕</button>
+
+          <div class="search-inline-actions">
+            <button id="voiceDrawerBtn" class="inline-pill-btn voice-pill" title="Search by Voice or Spoken Audio (768-D Semantic ASR)">
+              <span class="btn-svg" id="micIconSlot"></span>
+              <span>Voice</span>
+            </button>
+            <button id="containDrawerBtn" class="inline-pill-btn contain-pill" title="Verify if any clip, image, audio, or text is part of your files">
+              <span class="btn-svg" id="containIconSlot"></span>
+              <span>Verify Clip</span>
+            </button>
+          </div>
         </div>
 
         <div class="toolbar-actions">
-          <button id="voiceDrawerBtn" class="pill-action-btn voice-pill" title="Search by Spoken Audio or run 768-D Semantic-Space ASR">
-            <span class="btn-svg" id="micIconSlot"></span>
-            <span>Voice / ASR</span>
-          </button>
-
-          <button id="containDrawerBtn" class="pill-action-btn contain-pill" title="Check if any Image, Video, Audio, Document, or Text is part of your indexed files">
-            <span class="btn-svg" id="containIconSlot"></span>
-            <span>Part-of-File</span>
-          </button>
+          <div class="mode-pills" id="modePills">
+            <button class="mode-pill active" data-mode="hybrid" title="Words + 768-D Semantic Meaning">Hybrid</button>
+            <button class="mode-pill" data-mode="semantic" title="768-D EmbeddingGemma 2 Meaning">Meaning</button>
+            <button class="mode-pill" data-mode="lexical" title="Instant Keyword Match">Words</button>
+          </div>
 
           <div class="divider-v"></div>
 
@@ -45,63 +56,58 @@
             <span id="viewModeIconSlot"></span>
           </button>
 
-          <button id="togglePreviewBtn" class="toolbar-icon-btn active" title="Show / Hide Preview Pane">
+          <button id="togglePreviewBtn" class="toolbar-icon-btn active" title="Show / Hide Inspector Preview">
             <span id="previewIconSlot"></span>
           </button>
 
-          <button id="foldersModalBtn" class="toolbar-icon-btn" title="Folders, Estimator &amp; Indexing Settings">
+          <button id="foldersModalBtn" class="toolbar-icon-btn" title="Manage Indexed Folders &amp; Cost Estimator">
             <span id="gearIconSlot"></span>
           </button>
         </div>
       </div>
 
-      <!-- Kind Filter Chips + Mode Selector (matches KindFilters in SearchWindow.swift) -->
+      <!-- Scope Bar + Kind Filter Chips (macOS Finder / DigUp SearchWindow style) -->
       <div class="filters-row">
+        <div class="scope-pills" id="scopePills"></div>
         <div class="kind-chips" id="kindChips"></div>
-
-        <div class="mode-pills" id="modePills">
-          <button class="mode-pill active" data-mode="hybrid" title="Words + 768-D Meaning">All (Words + Meaning)</button>
-          <button class="mode-pill" data-mode="semantic" title="Pure 768-D EmbeddingGemma 2 Vector Search">Meaning (768-D)</button>
-          <button class="mode-pill" data-mode="lexical" title="Instant FTS5 Keyword Search">Words</button>
-        </div>
       </div>
 
-      <!-- Voice / 768-D Semantic-Space ASR Drawer -->
+      <!-- Voice / 768-D Semantic-Space ASR Bar -->
       <div id="voiceDrawer" class="feature-drawer hidden">
         <div class="drawer-header">
           <div>
-            <strong>🎙️ Spoken Audio Search &amp; EmbeddingGemma 2 Semantic-Space ASR</strong>
-            <span class="drawer-sub">Direct 768-D audio-to-multimodal retrieval + 1.6s/0.6s sub-window Conformer lexicon decoding</span>
+            <strong>🎙️ Spoken Audio Search &amp; 768-D Semantic-Space ASR</strong>
+            <span class="drawer-sub">Speak into your microphone or select an audio file to search across text, images, video &amp; audio</span>
           </div>
-          <button id="closeVoiceDrawerBtn" class="mini-btn">Close</button>
+          <button id="closeVoiceDrawerBtn" class="mini-btn">Done</button>
         </div>
         <div class="drawer-controls">
-          <button id="recordMicBtn" class="btn accent">🔴 Record 4s from Microphone</button>
-          <button id="tryDemoAudioBtn" class="btn primary">▶ Try Live Demo Audio Query (probe_audio_excerpt.wav)</button>
-          <input id="audioPathInput" type="text" placeholder="/path/to/audio.wav, .mp3, .m4a, .flac..." />
-          <button id="runAudioSearchBtn" class="btn secondary">Audio Search</button>
-          <button id="runAsrOnlyBtn" class="btn secondary">Inspect 768-D ASR</button>
+          <button id="recordMicBtn" class="btn accent">🔴 Record 4s Voice Query</button>
+          <button id="tryDemoAudioBtn" class="btn primary">▶ Sample Audio Query</button>
+          <input id="audioPathInput" type="text" placeholder="Or enter path to .wav, .mp3, .m4a, .flac…" />
+          <button id="runAudioSearchBtn" class="btn secondary">Search by Audio</button>
+          <button id="runAsrOnlyBtn" class="btn secondary">Decode Timeline</button>
         </div>
       </div>
 
-      <!-- Part-of-File Containment Verifier Drawer -->
+      <!-- Part-of-File Containment Verifier Bar -->
       <div id="containDrawer" class="feature-drawer hidden">
         <div class="drawer-header">
           <div>
-            <strong>🔍 Part-of-File Containment Verifier ("Is this inside my indexed files?")</strong>
-            <span class="drawer-sub">Verify whether any Image, Video clip, Audio excerpt, PDF, or Text passage is contained in the index with exact timestamps/lines</span>
+            <strong>🔍 Part-of-File Verifier (“Is this clip, image, or passage inside my files?”)</strong>
+            <span class="drawer-sub">Drop any file onto the window or test a candidate image, video clip, audio excerpt, or text passage</span>
           </div>
-          <button id="closeContainDrawerBtn" class="mini-btn">Close</button>
+          <button id="closeContainDrawerBtn" class="mini-btn">Done</button>
         </div>
         <div class="demo-probes-bar" id="demoProbesBar"></div>
         <div class="drawer-controls">
-          <input id="containFileInput" type="text" placeholder="/path/to/candidate/image.png, video.mp4, audio.wav, doc.pdf, or text..." />
-          <button id="runContainFileBtn" class="btn primary">Verify File Containment</button>
-          <button id="runMultimodalSearchBtn" class="btn secondary" title="Use this file as a multimodal search query">Search Similar</button>
+          <input id="containFileInput" type="text" placeholder="Path to candidate image, video clip, audio clip, or document…" />
+          <button id="runContainFileBtn" class="btn primary">Verify Containment</button>
+          <button id="runMultimodalSearchBtn" class="btn secondary" title="Find similar files across your computer">Find Similar</button>
         </div>
         <div class="drawer-controls">
-          <input id="containTextInput" type="text" placeholder="Or paste any text passage / code snippet here to verify exact line containment..." />
-          <button id="runContainTextBtn" class="btn accent">Verify Text Passage</button>
+          <input id="containTextInput" type="text" placeholder="Or paste any text passage / quote / code snippet to locate its exact file &amp; lines…" />
+          <button id="runContainTextBtn" class="btn accent">Locate Passage</button>
         </div>
       </div>
 
@@ -109,7 +115,7 @@
       <div id="statusBanner" class="status-banner hidden"></div>
     </header>
 
-    <!-- Main Split View: Left Grouped Results List / Grid + Right Big Preview & Facts Inspector -->
+    <!-- Main Split View: Left Grouped Results List / Grid + Right Inspector Preview -->
     <div class="workspace-body" id="workspaceBody">
       <div class="results-pane" id="resultsPane">
         <div id="resultsList" class="results-list" role="listbox"></div>
@@ -120,7 +126,7 @@
       </aside>
     </div>
 
-    <!-- Bottom Status Footer (matches DigUp SearchWindow.swift + panel.js) -->
+    <!-- Bottom Status Footer -->
     <footer class="status-footer">
       <button id="footerFolderBtn" class="footer-status-btn" title="Click to manage indexed folders &amp; run estimator">
         <span class="status-dot" id="statusDot"></span>
@@ -130,35 +136,36 @@
       <div class="footer-center" id="footerSummary">Ready</div>
 
       <div class="footer-keys" id="footerKeys">
-        <span><kbd>↑↓</kbd> Select</span>
+        <span><kbd>↑↓</kbd> Navigate</span>
+        <span><kbd>Space</kbd> Play/Preview</span>
         <span><kbd>↩</kbd> Open</span>
-        <span><kbd>Ctrl+↩</kbd> Show in Files</span>
+        <span><kbd>⌘↩</kbd> Show in Files</span>
       </div>
     </footer>
 
-    <!-- Folders, Cost Estimator & Indexing Modal (matches DigUp SetupWindow) -->
+    <!-- Folders, Cost Estimator & Indexing Sheet -->
     <div id="foldersModal" class="modal-backdrop hidden">
       <div class="modal-sheet">
         <div class="modal-header">
           <div>
-            <h2>Folders &amp; Indexing</h2>
-            <p class="modal-sub">Prism only looks where you tell it to. Choose a folder to estimate or index with EmbeddingGemma 2.</p>
+            <h2>Search Scope &amp; Indexing</h2>
+            <p class="modal-sub">Prism continuously watches and indexes your operating system folders using EmbeddingGemma 2 (768-D).</p>
           </div>
           <button id="closeModalBtn" class="icon-btn">✕</button>
         </div>
 
         <div class="modal-section">
-          <label class="field-label">Active Indexed Folder</label>
+          <label class="field-label">Active Scope or Custom Folder</label>
           <div class="folder-input-row">
-            <input id="folderInput" type="text" placeholder="/path/to/folder" />
-            <button id="estimateFolderBtn" class="btn secondary">Estimate Cost</button>
-            <button id="indexFolderBtn" class="btn primary">Index Now</button>
-            <button id="forceIndexBtn" class="btn accent" title="Re-index all files from scratch">Re-Index</button>
+            <input id="folderInput" type="text" placeholder="ALL_OS or /path/to/folder" />
+            <button id="estimateFolderBtn" class="btn secondary">Estimate</button>
+            <button id="indexFolderBtn" class="btn primary">Sync &amp; Index</button>
+            <button id="forceIndexBtn" class="btn accent" title="Rebuild embeddings from scratch">Rebuild</button>
           </div>
         </div>
 
         <div class="modal-section">
-          <label class="field-label">Quick Folder Presets</label>
+          <label class="field-label">Quick Scopes</label>
           <div id="folderPresetsGrid" class="presets-grid"></div>
         </div>
 

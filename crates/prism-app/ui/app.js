@@ -36,16 +36,16 @@ const GROUP_TITLES = {
 
 const KIND_FILTERS = [
   { key: null, label: "All" },
+  { key: "document", label: "PDFs & Office" },
+  { key: "text", label: "Notes & Docs" },
   { key: "image", label: "Images" },
   { key: "video", label: "Videos" },
   { key: "audio", label: "Audio" },
-  { key: "text", label: "Documents" },
-  { key: "document", label: "PDFs & Office" },
   { key: "code", label: "Code" },
 ];
 
 const WEAKER_ID = "__weaker_toggle__";
-const TYPING_PAUSE_MS = 120;
+const TYPING_PAUSE_MS = 110;
 
 const state = {
   activeDir: "ALL_OS",
@@ -77,14 +77,17 @@ const state = {
 const previewCache = new Map();
 
 // DOM references
+const $dropZone = document.getElementById("dropZone");
 const $searchIcon = document.getElementById("searchIcon");
 const $queryInput = document.getElementById("queryInput");
+const $shortcutHint = document.getElementById("shortcutHint");
 const $clearQueryBtn = document.getElementById("clearQueryBtn");
 const $voiceDrawerBtn = document.getElementById("voiceDrawerBtn");
 const $containDrawerBtn = document.getElementById("containDrawerBtn");
 const $viewModeBtn = document.getElementById("viewModeBtn");
 const $togglePreviewBtn = document.getElementById("togglePreviewBtn");
 const $foldersModalBtn = document.getElementById("foldersModalBtn");
+const $scopePills = document.getElementById("scopePills");
 const $kindChips = document.getElementById("kindChips");
 const $modePills = document.getElementById("modePills");
 const $voiceDrawer = document.getElementById("voiceDrawer");
@@ -124,6 +127,39 @@ function clock(seconds) {
     : `${Math.trunc(total / 60)}:${two(total % 60)}`;
 }
 
+function relativeTime(modifiedUnix) {
+  const ts = Number(modifiedUnix) || 0;
+  if (ts <= 0) return "";
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const diff = Math.max(0, nowSecs - ts);
+  if (diff < 90) return "Just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 172800) return "Yesterday";
+  if (diff < 7 * 86400) return `${Math.floor(diff / 86400)}d ago`;
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function formatBytes(bytes) {
+  const b = Number(bytes) || 0;
+  if (b <= 0) return "";
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(b < 10240 ? 1 : 0)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function prettyPath(p) {
+  const str = String(p || "");
+  return str.replace(/^\/home\/[^/]+/, "~").replace(/^\/Users\/[^/]+/, "~");
+}
+
+function parentFolderDisplay(p) {
+  const pretty = prettyPath(p);
+  const idx = pretty.lastIndexOf("/");
+  return idx > 0 ? pretty.slice(0, idx) : pretty;
+}
+
 function placeOf(hit) {
   if (state.resultMode === "containment") {
     return `${Math.round((hit.confidence || 0) * 100)}% · ${hit.location_summary || "Match"}`;
@@ -138,6 +174,9 @@ function placeOf(hit) {
     return orig.line_start === orig.line_end
       ? `L${orig.line_start}`
       : `L${orig.line_start}–${orig.line_end}`;
+  }
+  if (orig.line_start != null) {
+    return `L${orig.line_start}`;
   }
   return null;
 }
@@ -154,25 +193,44 @@ function reasonOf(hit) {
     return parts.join(" · ");
   }
 
+  // Ongoing browse mode: clean human recency & size summary without fake scores
+  if (state.phase === "browse" || (!state.query.trim() && !hit.raw_cosine)) {
+    const rel = relativeTime(hit.modified_unix);
+    const sz = formatBytes(hit.size_bytes);
+    const folder = parentFolderDisplay(hit.path);
+    return [rel ? `Modified ${rel}` : "Indexed file", sz, folder].filter(Boolean).join(" · ");
+  }
+
   const orig = hit.origin || {};
-  const metrics = `score=${(hit.score || 0).toFixed(2)} · z=${(hit.semantic_z || 0).toFixed(2)} · cos=${(hit.raw_cosine || 0).toFixed(3)}`;
+  const details = [];
+  if (hit.raw_cosine && hit.raw_cosine > 0.05) {
+    details.push(`${Math.round(hit.raw_cosine * 100)}% semantic match`);
+  }
+  if (hit.semantic_z && Math.abs(hit.semantic_z) >= 0.1) {
+    details.push(`z=${hit.semantic_z >= 0 ? "+" : ""}${hit.semantic_z.toFixed(2)}`);
+  }
+  if (hit.lexical_coverage && hit.lexical_coverage > 0) {
+    details.push("Exact words");
+  }
+  const suffix = details.length ? ` (${details.join(" · ")})` : "";
+
   if (hit.modality === "image") {
     if (orig.start_seconds != null) {
-      return `Matches video frame at ${clock(orig.start_seconds)} (${metrics})`;
+      return `Matches video frame at ${clock(orig.start_seconds)}${suffix}`;
     }
-    return `Matches visual appearance (${metrics})`;
+    return `Matches visual appearance${suffix}`;
   }
   if (hit.modality === "audio") {
     const at = orig.start_seconds != null ? ` at ${clock(orig.start_seconds)}` : "";
-    return `Matches what's heard${at} via 768-D Conformer + Semantic ASR (${metrics})`;
+    return `Matches what's heard${at} via 768-D Conformer + Semantic ASR${suffix}`;
   }
   if (orig.page != null) {
-    return `Matches page ${orig.page} (${metrics})`;
+    return `Matches page ${orig.page}${suffix}`;
   }
   if (orig.line_start != null) {
-    return `Matches lines ${orig.line_start}–${orig.line_end ?? orig.line_start} (${metrics})`;
+    return `Matches lines ${orig.line_start}–${orig.line_end ?? orig.line_start}${suffix}`;
   }
-  return `Matches content (${metrics})`;
+  return `Matches content${suffix}`;
 }
 
 function escaped(text) {
@@ -204,7 +262,33 @@ function getPreviewDataUrl(path, kind, loc, pixels) {
   return previewCache.get(key);
 }
 
-// Render KindFilter chips (SearchWindow.swift style)
+// Render 1-Click Scope Pills in Header (macOS Finder / Spotlight style)
+function renderScopePills() {
+  if (!$scopePills) return;
+  $scopePills.replaceChildren();
+  const shortLabels = {
+    "🌐 Whole Operating System (All User Folders)": "🌐 All Computer",
+    "Documents": "📄 Documents",
+    "Downloads": "⬇️ Downloads",
+    "Pictures": "🖼️ Pictures",
+    "Videos": "🎬 Videos",
+    "Music & Audio": "🎵 Audio",
+    "Desktop": "💻 Desktop",
+    "Live Demo Corpus": "🧪 Demo Corpus",
+  };
+
+  for (const preset of state.presets) {
+    if (preset.label === "Current Workspace") continue;
+    const pill = document.createElement("button");
+    pill.className = "scope-pill" + (preset.path === state.activeDir ? " active" : "");
+    pill.textContent = shortLabels[preset.label] || preset.label;
+    pill.title = `${preset.label} (${preset.indexed_files} indexed files)`;
+    pill.onclick = () => switchActiveFolder(preset.path);
+    $scopePills.appendChild(pill);
+  }
+}
+
+// Render KindFilter chips
 function renderKindChips() {
   $kindChips.replaceChildren();
   const totalCount = Object.values(state.kindCounts).reduce((a, b) => a + b, 0);
@@ -229,16 +313,16 @@ function renderDemoProbes() {
   $demoProbesBar.replaceChildren();
   if (!state.demoProbes.length) return;
   const label = document.createElement("span");
-  label.style.fontSize = "11.5px";
+  label.style.fontSize = "11px";
   label.style.color = "var(--text-secondary)";
-  label.textContent = "1-Click Live Probes:";
+  label.textContent = "Sample Clips:";
   $demoProbesBar.appendChild(label);
 
   for (const probe of state.demoProbes) {
     const chip = document.createElement("button");
     chip.className = "probe-chip";
     chip.title = probe.description;
-    chip.textContent = `Check ${probe.label} (${probe.kind})`;
+    chip.textContent = `${probe.label} (${probe.kind})`;
     chip.onclick = () => {
       document.getElementById("containFileInput").value = probe.path;
       runFileContainment(probe.path);
@@ -254,7 +338,7 @@ function renderFolderPresets() {
     card.className = "preset-card" + (preset.path === state.activeDir ? " active" : "");
     card.innerHTML = `
       <div class="p-label">${escaped(preset.label)}</div>
-      <div class="p-path">${escaped(preset.path)}</div>
+      <div class="p-path">${escaped(prettyPath(preset.path))}</div>
       <div class="p-meta">${preset.indexed_files} indexed files (${preset.total_chunks} chunks)</div>
     `;
     card.onclick = async () => {
@@ -271,6 +355,7 @@ async function switchActiveFolder(newDir) {
     state.stats = await invoke("get_status", { dir: newDir });
     state.kindCounts = await invoke("get_kind_counts", { dir: newDir });
   } catch (_) {}
+  renderScopePills();
   renderKindChips();
   renderFolderPresets();
   updateFooterStatus();
@@ -279,56 +364,62 @@ async function switchActiveFolder(newDir) {
 
 function updateFooterStatus() {
   if (!state.stats) {
-    $footerFolderText.textContent = state.activeDir === "ALL_OS" ? "🌐 Whole Operating System" : state.activeDir;
+    $footerFolderText.textContent = state.activeDir === "ALL_OS" ? "🌐 All Computer" : prettyPath(state.activeDir);
     return;
   }
   const scopeLabel =
     state.activeDir === "ALL_OS"
-      ? "🌐 Whole Operating System (Documents, Downloads, Pictures, Videos, Music, Desktop)"
-      : state.activeDir;
+      ? "All Computer (Documents, Downloads, Pictures, Videos, Music, Desktop)"
+      : prettyPath(state.activeDir);
   if (state.pendingEmbeddings > 0) {
     $statusDot.classList.add("busy");
-    $footerFolderText.textContent = `${state.stats.indexed_files} files searchable (${state.stats.total_chunks} chunks) · embedding ${state.pendingEmbeddings} in background · ${scopeLabel}`;
+    $footerFolderText.textContent = `Watching ${state.stats.indexed_files.toLocaleString()} files · indexing 768-D vectors in background · ${scopeLabel}`;
   } else {
     $statusDot.classList.remove("busy");
-    $footerFolderText.textContent = `Up to date · ${state.stats.indexed_files} files (${state.stats.total_chunks} chunks) · ${scopeLabel}`;
+    $footerFolderText.textContent = `Live · ${state.stats.indexed_files.toLocaleString()} files indexed · ${scopeLabel}`;
   }
 }
 
-function scheduleBackgroundEmbedStep(delayMs = 1800) {
+function scheduleBackgroundEmbedStep(delayMs = 2000) {
   clearTimeout(state.bgTimer);
-  if (state.pendingEmbeddings <= 0) return;
   state.bgTimer = setTimeout(async () => {
     if (state.timer || state.bgRunning) {
-      scheduleBackgroundEmbedStep(2000);
+      scheduleBackgroundEmbedStep(2200);
       return;
     }
     state.bgRunning = true;
     try {
+      const prevFiles = state.stats?.indexed_files || 0;
       const prog = await invoke("embed_os_step", {
         dir: state.activeDir,
-        batchSize: 2,
+        batchSize: state.pendingEmbeddings > 0 ? 3 : 0,
       });
       state.pendingEmbeddings = prog.remaining_pending || 0;
       if (prog.stats) {
         state.stats = prog.stats;
       }
       updateFooterStatus();
-      if (state.pendingEmbeddings > 0) {
-        scheduleBackgroundEmbedStep(1200);
+
+      // If new OS files were created/modified on disk while in browse mode, refresh live!
+      if (prog.stats && prog.stats.indexed_files !== prevFiles && state.phase === "browse") {
+        await browseCurrentFolder(state.generation);
       }
     } catch (_) {
     } finally {
       state.bgRunning = false;
+      scheduleBackgroundEmbedStep(state.pendingEmbeddings > 0 ? 1500 : 4000);
     }
   }, delayMs);
 }
 
-// Instant lexical + 120ms hybrid search pipeline (matches panel.js)
+// Instant lexical + 110ms hybrid search pipeline
 function onQueryChanged() {
   const q = $queryInput.value;
   state.query = q;
   $clearQueryBtn.classList.toggle("hidden", q.length === 0);
+  if ($shortcutHint) {
+    $shortcutHint.classList.toggle("hidden", q.length > 0);
+  }
 
   const isCode = q.trim().toLowerCase().startsWith("code:");
   $searchIcon.innerHTML = isCode ? ICONS.code : ICONS.search;
@@ -337,13 +428,12 @@ function onQueryChanged() {
   clearTimeout(state.timer);
 
   if (!q.trim()) {
-    state.statusBannerHidden = true;
     $statusBanner.classList.add("hidden");
     browseCurrentFolder(gen);
     return;
   }
 
-  // Step 1: Immediate FTS5 keyword search (<3ms)
+  // Step 1: Immediate FTS5 keyword search (<5ms)
   if (state.mode !== "semantic") {
     invoke("search_folder", {
       dir: state.activeDir,
@@ -360,7 +450,7 @@ function onQueryChanged() {
       .catch(() => {});
   }
 
-  // Step 2: After 120ms pause, full EmbeddingGemma 2 768-D Hybrid/Semantic search
+  // Step 2: After 110ms pause, full EmbeddingGemma 2 768-D Hybrid/Semantic search
   state.timer = setTimeout(() => {
     invoke("search_folder", {
       dir: state.activeDir,
@@ -384,6 +474,9 @@ async function triggerSearchNow() {
   clearTimeout(state.timer);
   state.query = $queryInput.value;
   $clearQueryBtn.classList.toggle("hidden", state.query.length === 0);
+  if ($shortcutHint) {
+    $shortcutHint.classList.toggle("hidden", state.query.length > 0);
+  }
   const gen = ++state.generation;
   if (!state.query.trim()) {
     await browseCurrentFolder(gen);
@@ -419,7 +512,6 @@ function applySearchResponse(resp, phase) {
   state.phase = phase;
   state.elapsedMs = resp.elapsed_ms || 0;
 
-  // Show Semantic-Space ASR banner if audio search was used
   if (resp.decoded_audio_transcript) {
     $statusBanner.className = "status-banner";
     const kws = (resp.distilled_audio_keywords || [])
@@ -435,7 +527,6 @@ function applySearchResponse(resp, phase) {
   }
 
   const hits = resp.hits || [];
-  // Split into strong matches and weaker matches (like DigUp SearchPanel)
   const strongHits = [];
   const weakerHits = [];
   for (let i = 0; i < hits.length; i++) {
@@ -534,7 +625,7 @@ function renderResultsList() {
     empty.className = "empty-message";
     empty.innerHTML = `
       <strong>No matching files found</strong>
-      <span>Try describing what you'd see or hear in it, words you remember from it, or click Folders (⚙️) to index a folder.</span>
+      <span>Try describing what you'd see or hear in it, words you remember from it, or switch scopes above.</span>
     `;
     $resultsList.appendChild(empty);
     return;
@@ -641,12 +732,30 @@ function createListRow(hit) {
     titleRow.appendChild(badge);
   }
 
+  if (state.resultMode === "search" && state.phase !== "browse" && hit.raw_cosine && hit.raw_cosine >= 0.45) {
+    const semBadge = document.createElement("span");
+    semBadge.className = "place-badge semantic";
+    semBadge.textContent = `${Math.round(hit.raw_cosine * 100)}%`;
+    semBadge.title = `768-D EmbeddingGemma 2 similarity (z=${(hit.semantic_z || 0).toFixed(2)})`;
+    titleRow.appendChild(semBadge);
+  }
+
+  const relTime = relativeTime(hit.modified_unix);
+  if (relTime) {
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "time-badge";
+    timeSpan.textContent = relTime;
+    titleRow.appendChild(timeSpan);
+  }
+
   const subRow = document.createElement("div");
   subRow.className = "row-sub";
-  if (hit.snippet) {
-    subRow.innerHTML = highlighted(hit.snippet, state.query);
+  const folder = parentFolderDisplay(hit.path);
+  if (hit.snippet && !hit.snippet.startsWith(hit.file_name)) {
+    subRow.innerHTML = `<span class="folder-hint">${escaped(folder)} · </span>${highlighted(hit.snippet, state.query)}`;
   } else {
-    subRow.textContent = hit.relative_path;
+    const sz = formatBytes(hit.size_bytes);
+    subRow.innerHTML = `<span class="folder-hint">${escaped(folder)}${sz ? ` · ${escaped(sz)}` : ""}</span>`;
   }
 
   textCol.appendChild(titleRow);
@@ -689,7 +798,7 @@ function createGridCell(hit) {
   kindPill.innerHTML = ICONS[hit.kind] || ICONS.doc;
   frame.appendChild(kindPill);
 
-  const place = placeOf(hit);
+  const place = placeOf(hit) || relativeTime(hit.modified_unix);
   if (place) {
     const pBadge = document.createElement("div");
     pBadge.className = "grid-place-pill";
@@ -701,7 +810,7 @@ function createGridCell(hit) {
   meta.className = "grid-meta";
   meta.innerHTML = `
     <div class="title">${escaped(hit.file_name || hit.relative_path)}</div>
-    <div class="folder">${escaped(hit.relative_path)}</div>
+    <div class="folder">${escaped(parentFolderDisplay(hit.path))}</div>
   `;
 
   cell.appendChild(frame);
@@ -722,8 +831,8 @@ function renderPreviewPane() {
     const empty = document.createElement("div");
     empty.className = "empty-message";
     empty.innerHTML = `
-      <strong>Select a result to inspect</strong>
-      <span>Preview images, play matched video &amp; audio moments, inspect highlighted text passages, or verify containment.</span>
+      <strong>Select a file to inspect</strong>
+      <span>Preview images, play matched video &amp; audio moments, inspect highlighted passages, or verify containment.</span>
     `;
     $previewContent.appendChild(empty);
     return;
@@ -809,7 +918,6 @@ function renderPreviewPane() {
     pictureBox.appendChild(passage);
   }
 
-  // Facts & Why-It-Matched section (matches facts(hit) in panel.js)
   const facts = document.createElement("div");
   facts.className = "facts";
 
@@ -819,7 +927,9 @@ function renderPreviewPane() {
 
   const pathEl = document.createElement("div");
   pathEl.className = "line";
-  pathEl.textContent = hit.path;
+  const sz = formatBytes(hit.size_bytes);
+  const rel = relativeTime(hit.modified_unix);
+  pathEl.textContent = [prettyPath(hit.path), sz, rel ? `Modified ${rel}` : ""].filter(Boolean).join(" · ");
 
   const reasonEl = document.createElement("div");
   reasonEl.className = "reason";
@@ -827,7 +937,7 @@ function renderPreviewPane() {
 
   facts.append(titleEl, pathEl, reasonEl);
 
-  if (hit.snippet) {
+  if (hit.snippet && !hit.snippet.startsWith(hit.file_name)) {
     const excerptBox = document.createElement("div");
     excerptBox.className = "reason-text";
     excerptBox.innerHTML = highlighted(hit.snippet, state.query);
@@ -864,7 +974,7 @@ function renderFooterSummary() {
   if (state.phase === "words") {
     $footerSummary.textContent = `Matching words… (${state.elapsedMs.toFixed(1)} ms)`;
   } else if (state.phase === "browse") {
-    $footerSummary.textContent = `Browsing ${strongCount} indexed ${strongCount === 1 ? "file" : "files"}`;
+    $footerSummary.textContent = `Recent ongoing activity · ${strongCount} files`;
   } else if (state.phase === "containment") {
     $footerSummary.textContent = `Part-of-File Verification · ${strongCount} strong · ${weakerCount} weaker (${state.elapsedMs.toFixed(1)} ms)`;
   } else {
@@ -1089,7 +1199,7 @@ document.getElementById("recordMicBtn").addEventListener("click", async () => {
   } catch (err) {
     alert(`Microphone recording error: ${err}`);
   } finally {
-    btn.textContent = "🔴 Record 4s from Microphone";
+    btn.textContent = "🔴 Record 4s Voice Query";
   }
 });
 
@@ -1106,7 +1216,7 @@ document.getElementById("tryDemoAudioBtn").addEventListener("click", async () =>
     applySearchResponse(resp, "meaning");
     await inspectAudioAsr(demoAudio);
   } catch (err) {
-    alert(`Demo audio search error: ${err}`);
+    alert(`Audio search error: ${err}`);
   }
 });
 
@@ -1157,14 +1267,34 @@ document.getElementById("runContainTextBtn").addEventListener("click", () => {
   runTextContainment(document.getElementById("containTextInput").value);
 });
 
-// Global Keyboard Navigation (matches panel.js + SearchWindow.swift)
+// Global Keyboard Navigation (macOS Spotlight / DigUp style)
 document.addEventListener("keydown", (event) => {
   if (event.isComposing) return;
   const mod = event.metaKey || event.ctrlKey;
 
+  if (mod && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    $queryInput.focus();
+    $queryInput.select();
+    return;
+  }
+
+  if (event.key === "/" && document.activeElement !== $queryInput && document.activeElement?.tagName !== "INPUT") {
+    event.preventDefault();
+    $queryInput.focus();
+    return;
+  }
+
   if (event.key === "Escape") {
     if (!$foldersModal.classList.contains("hidden")) {
       $foldersModal.classList.add("hidden");
+      return;
+    }
+    if (!$voiceDrawer.classList.contains("hidden") || !$containDrawer.classList.contains("hidden")) {
+      $voiceDrawer.classList.add("hidden");
+      $containDrawer.classList.add("hidden");
+      $voiceDrawerBtn.classList.remove("active");
+      $containDrawerBtn.classList.remove("active");
       return;
     }
     if ($queryInput.value) {
@@ -1180,7 +1310,22 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (event.key === "Enter" && document.activeElement === $queryInput) {
+  if (event.key === " " && document.activeElement !== $queryInput && document.activeElement?.tagName !== "INPUT") {
+    event.preventDefault();
+    const overlay = $previewContent.querySelector(".video-moment-overlay");
+    const media = $previewContent.querySelector("video, audio");
+    if (overlay) {
+      overlay.click();
+    } else if (media) {
+      if (media.paused) media.play();
+      else media.pause();
+    } else {
+      $togglePreviewBtn.click();
+    }
+    return;
+  }
+
+  if (event.key === "Enter" && (document.activeElement === $queryInput || document.activeElement?.tagName !== "INPUT")) {
     event.preventDefault();
     const hit = selectedHit();
     if (mod && hit) revealHit(hit);
@@ -1206,6 +1351,7 @@ async function initApp() {
     state.kindCounts = init.kind_counts || {};
 
     $folderInput.value = state.activeDir;
+    renderScopePills();
     renderKindChips();
     renderDemoProbes();
     renderFolderPresets();
@@ -1216,7 +1362,7 @@ async function initApp() {
     const testMode = await invoke("get_ui_test_mode");
     if (testMode) {
       await runAutomatedUiTest(testMode);
-    } else if (state.pendingEmbeddings > 0) {
+    } else {
       scheduleBackgroundEmbedStep(1500);
     }
   } catch (err) {
@@ -1239,7 +1385,7 @@ async function runAutomatedUiTest(mode) {
   };
 
   const steps = [];
-  steps.push(snapshotDom("1_initial_os_wide_browse"));
+  steps.push(snapshotDom("1_initial_ongoing_os_browse"));
 
   // Step 2: Real OS-Wide File Search (searching user's real OS files in ~/Downloads & ~/Documents)
   $queryInput.value = "PhD Proposal";

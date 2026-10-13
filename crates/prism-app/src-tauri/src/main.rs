@@ -310,9 +310,14 @@ async fn embed_os_step(
 ) -> Result<BackgroundEmbedProgress, String> {
     let app_state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // 1. Live ongoing filesystem sync across OS roots (<180ms) to pick up newly created/modified files
+        let os_roots = IndexStore::default_os_roots();
+        let _ = Indexer::sync_os_roots_fast(&os_roots);
+
+        // 2. Embed next batch of pending OS files into 768-D EmbeddingGemma 2 vector store
         let (embedder, asr) = app_state.get_or_init()?;
         let (embedded_now, remaining_pending) =
-            Indexer::embed_pending_global_batch(&embedder, Some(&asr), batch_size.unwrap_or(2))
+            Indexer::embed_pending_global_batch(&embedder, Some(&asr), batch_size.unwrap_or(3))
                 .map_err(|e| e.to_string())?;
         let (stats, _, _) = compute_scoped_stats_and_kinds(&dir)?;
         Ok(BackgroundEmbedProgress {
@@ -339,14 +344,17 @@ async fn browse_folder(
             rows.retain(|r| r.relative_path.starts_with(prefix));
         }
 
-        // Prioritize demo corpus & embedded multimodal files, then recent files across categories
+        // Prioritize real user OS files by most recent modification time (ongoing OS activity)
+        let is_tmp_scope = dir.starts_with("/tmp");
         rows.sort_by(|a, b| {
-            let a_demo = a.relative_path.starts_with("/tmp/prism_live_demo");
-            let b_demo = b.relative_path.starts_with("/tmp/prism_live_demo");
-            b_demo
-                .cmp(&a_demo)
-                .then_with(|| b.vector_slot.is_some().cmp(&a.vector_slot.is_some()))
-                .then_with(|| b.modified_unix.cmp(&a.modified_unix))
+            if !is_tmp_scope {
+                let a_tmp = a.relative_path.starts_with("/tmp/");
+                let b_tmp = b.relative_path.starts_with("/tmp/");
+                if a_tmp != b_tmp {
+                    return a_tmp.cmp(&b_tmp);
+                }
+            }
+            b.modified_unix.cmp(&a.modified_unix)
         });
 
         let kind_filter = kind.as_deref().and_then(SearchKind::from_str);
@@ -372,11 +380,11 @@ async fn browse_folder(
                 file_name: row.file_name,
                 kind: row.kind,
                 modality: row.modality,
-                score: 3.0,
-                semantic_z: 2.2,
-                raw_cosine: 1.0,
-                lexical_coverage: 1.0,
-                snippet: row.text_content.chars().take(260).collect(),
+                score: 0.0,
+                semantic_z: 0.0,
+                raw_cosine: 0.0,
+                lexical_coverage: 0.0,
+                snippet: row.text_content.chars().take(240).collect(),
                 origin: row.origin,
                 modified_unix: row.modified_unix,
                 size_bytes: row.size_bytes,

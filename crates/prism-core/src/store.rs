@@ -80,10 +80,6 @@ impl IndexStore {
     /// Standard OS user directories indexed by default for OS-wide search (matches DigUp Setup offered roots).
     pub fn default_os_roots() -> Vec<PathBuf> {
         let mut roots = Vec::new();
-        let demo = PathBuf::from("/tmp/prism_live_demo/corpus");
-        if demo.is_dir() {
-            roots.push(demo);
-        }
         let candidates = [
             dirs::document_dir(),
             dirs::download_dir(),
@@ -99,6 +95,13 @@ impl IndexStore {
                 if seen.insert(canon.clone()) {
                     roots.push(canon);
                 }
+            }
+        }
+        let demo = PathBuf::from("/tmp/prism_live_demo/corpus");
+        if demo.is_dir() {
+            let canon = fs::canonicalize(&demo).unwrap_or(demo);
+            if seen.insert(canon.clone()) {
+                roots.push(canon);
             }
         }
         roots
@@ -303,7 +306,7 @@ impl IndexStore {
             )?;
             let file_id = tx.last_insert_rowid();
 
-            let fast_text = extract_fast_preview_text(f);
+            let (fast_text, page, line_start, line_end) = extract_fast_preview_text(f);
             let modality = match f.kind {
                 SearchKind::Image => ChunkModality::Image,
                 SearchKind::Audio => ChunkModality::Audio,
@@ -314,8 +317,8 @@ impl IndexStore {
                 "INSERT INTO chunks (
                      file_id, chunk_index, modality, sets_scale, vector_slot, ahash,
                      text_content, page, line_start, line_end, start_seconds, end_seconds
-                 ) VALUES (?1, 0, ?2, 0, NULL, NULL, ?3, NULL, 1, NULL, NULL, NULL)",
-                params![file_id, modality.as_str(), fast_text],
+                 ) VALUES (?1, 0, ?2, 0, NULL, NULL, ?3, ?4, ?5, ?6, NULL, NULL)",
+                params![file_id, modality.as_str(), fast_text, page, line_start, line_end],
             )?;
             let chunk_id = tx.last_insert_rowid();
             let norm_title =
@@ -327,6 +330,19 @@ impl IndexStore {
             )?;
             synced_count += 1;
         }
+
+        // Ensure existing unembedded PDF/Image/Video/Audio rows have accurate origin metadata
+        let _ = tx.execute(
+            "UPDATE chunks
+             SET line_start = NULL,
+                 page = CASE
+                     WHEN (SELECT kind FROM files WHERE files.id = chunks.file_id) IN ('document', 'presentation') THEN 1
+                     ELSE NULL
+                 END
+             WHERE vector_slot IS NULL
+               AND (SELECT kind FROM files WHERE files.id = chunks.file_id) NOT IN ('text', 'code', 'spreadsheet')",
+            [],
+        );
 
         tx.commit()?;
         Ok(synced_count)
@@ -421,17 +437,7 @@ impl IndexStore {
              FROM files
              WHERE embedded = 0
              ORDER BY
-                 CASE WHEN relative_path LIKE '/tmp/prism_live_demo%' THEN 0 ELSE 1 END ASC,
-                 CASE kind
-                     WHEN 'text' THEN 0
-                     WHEN 'document' THEN 1
-                     WHEN 'image' THEN 2
-                     WHEN 'audio' THEN 3
-                     WHEN 'video' THEN 4
-                     WHEN 'spreadsheet' THEN 5
-                     WHEN 'presentation' THEN 6
-                     ELSE 7
-                 END ASC,
+                 CASE WHEN relative_path LIKE '/tmp/%' THEN 1 ELSE 0 END ASC,
                  modified_unix DESC
              LIMIT ?1",
         )?;
@@ -743,35 +749,50 @@ impl IndexStore {
     }
 }
 
-fn extract_fast_preview_text(file: &CrawledFile) -> String {
+fn extract_fast_preview_text(
+    file: &CrawledFile,
+) -> (String, Option<i64>, Option<i64>, Option<i64>) {
     if matches!(
         file.kind,
         SearchKind::Text | SearchKind::Code | SearchKind::Spreadsheet
-    ) && file.size_bytes <= 512 * 1024
+    ) && file.size_bytes <= 1024 * 1024
     {
         if let Ok(mut f) = fs::File::open(&file.path) {
-            let mut buf = vec![0u8; (file.size_bytes as usize).min(4096)];
+            let mut buf = vec![0u8; (file.size_bytes as usize).min(8192)];
             if let Ok(n) = f.read(&mut buf) {
                 buf.truncate(n);
                 let text = String::from_utf8_lossy(&buf);
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    return trimmed.chars().take(1800).collect();
+                    let snippet: String = trimmed.chars().take(2400).collect();
+                    let line_count = snippet.lines().count().max(1) as i64;
+                    return (snippet, None, Some(1), Some(line_count));
                 }
             }
         }
     }
-    let parent_name = file
+    let parent_display = file
         .path
         .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|p| {
+            let s = p.to_string_lossy().to_string();
+            if let Some(home) = dirs::home_dir() {
+                let h = home.to_string_lossy();
+                if s.starts_with(h.as_ref()) {
+                    return format!("~{}", &s[h.len()..]);
+                }
+            }
+            s
+        })
         .unwrap_or_default();
-    format!(
-        "{} ({}) — {}",
-        file.file_name,
-        file.kind.as_str(),
-        parent_name
-    )
+    let label = format!("{} · {}", file.file_name, parent_display);
+    match file.kind {
+        SearchKind::Document | SearchKind::Presentation => (label, Some(1), None, None),
+        SearchKind::Text | SearchKind::Code | SearchKind::Spreadsheet => {
+            (label, None, Some(1), Some(1))
+        }
+        _ => (label, None, None, None),
+    }
 }
+
 
