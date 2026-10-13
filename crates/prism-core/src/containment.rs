@@ -30,8 +30,11 @@ impl ContainmentEngine {
         limit: usize,
     ) -> Result<ContainmentResponse> {
         let start = Instant::now();
-        let store = IndexStore::open(root)?;
-        let chunks = store.load_all_chunks()?;
+        let (store, scope_prefix) = IndexStore::open_target(&root.to_string_lossy())?;
+        let mut chunks = store.load_all_chunks()?;
+        if let Some(ref prefix) = scope_prefix {
+            chunks.retain(|c| c.relative_path.starts_with(prefix));
+        }
         let kind = classify_path(input_path).unwrap_or(SearchKind::Text);
         let file_name = input_path
             .file_name()
@@ -79,8 +82,11 @@ impl ContainmentEngine {
         limit: usize,
     ) -> Result<ContainmentResponse> {
         let start = Instant::now();
-        let store = IndexStore::open(root)?;
-        let chunks = store.load_all_chunks()?;
+        let (store, scope_prefix) = IndexStore::open_target(&root.to_string_lossy())?;
+        let mut chunks = store.load_all_chunks()?;
+        if let Some(ref prefix) = scope_prefix {
+            chunks.retain(|c| c.relative_path.starts_with(prefix));
+        }
 
         let hits = Self::score_text_containment(&store, &chunks, embedder, text_snippet, limit)?;
         let best_confidence = hits.first().map(|h| h.confidence).unwrap_or(0.0);

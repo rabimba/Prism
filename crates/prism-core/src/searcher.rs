@@ -16,12 +16,24 @@ use crate::vectors::compute_modality_z_scores;
 
 pub struct Searcher {
     store: IndexStore,
+    scope_prefix: Option<String>,
 }
 
 impl Searcher {
     pub fn open(root: &Path) -> Result<Self> {
-        let store = IndexStore::open(root)?;
-        Ok(Self { store })
+        let (store, scope_prefix) = IndexStore::open_target(&root.to_string_lossy())?;
+        Ok(Self {
+            store,
+            scope_prefix,
+        })
+    }
+
+    pub fn open_global() -> Result<Self> {
+        let store = IndexStore::open_global()?;
+        Ok(Self {
+            store,
+            scope_prefix: None,
+        })
     }
 
     pub fn store(&self) -> &IndexStore {
@@ -30,6 +42,10 @@ impl Searcher {
 
     pub fn store_mut(&mut self) -> &mut IndexStore {
         &mut self.store
+    }
+
+    pub fn scope_prefix(&self) -> Option<&str> {
+        self.scope_prefix.as_deref()
     }
 
     /// Perform hybrid, semantic, or lexical search for a text query.
@@ -41,9 +57,21 @@ impl Searcher {
         filter: &SearchFilter,
     ) -> Result<SearchResponse> {
         let start = Instant::now();
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(SearchResponse {
+                query: String::new(),
+                mode,
+                elapsed_ms: 0.0,
+                decoded_audio_transcript: None,
+                distilled_audio_keywords: Vec::new(),
+                hits: Vec::new(),
+            });
+        }
+
         let query_vec = if mode != SearchMode::Lexical {
             if let Some(emb) = embedder {
-                Some(emb.embed_query(query)?)
+                Some(emb.embed_query(trimmed)?)
             } else {
                 None
             }
@@ -51,9 +79,9 @@ impl Searcher {
             None
         };
 
-        let hits = self.rank_chunks(query, query_vec.as_deref(), mode, filter)?;
+        let hits = self.rank_chunks(trimmed, query_vec.as_deref(), mode, filter)?;
         Ok(SearchResponse {
-            query: query.to_string(),
+            query: trimmed.to_string(),
             mode,
             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
             decoded_audio_transcript: None,
@@ -122,7 +150,6 @@ impl Searcher {
             if let Ok(prf_keywords) =
                 asr_engine.distill_corpus_keywords(embedder, asr, &candidate_texts, 8)
             {
-                // Merge high-Z PRF keywords into distilled_keywords & semantic_transcript
                 let mut existing: HashSet<String> = asr
                     .distilled_keywords
                     .iter()
@@ -255,7 +282,29 @@ impl Searcher {
         mode: SearchMode,
         filter: &SearchFilter,
     ) -> Result<Vec<SearchHit>> {
-        let chunks = self.store.load_all_chunks()?;
+        let all_chunks = self.store.load_all_chunks()?;
+        if all_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Apply folder scope prefix filter before computing modality Z-scores so Z-scores are calibrated over the active scope
+        let active_prefix = filter
+            .path_prefix
+            .as_deref()
+            .or(self.scope_prefix.as_deref());
+
+        let chunks: Vec<&IndexedChunkRow> = all_chunks
+            .iter()
+            .filter(|c| {
+                if let Some(prefix) = active_prefix {
+                    if !c.relative_path.starts_with(prefix) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
@@ -285,7 +334,7 @@ impl Searcher {
         let (meaning_weight, words_weight) = match mode {
             SearchMode::Semantic => (1.0, 0.0),
             SearchMode::Lexical => (0.0, 4.0),
-            SearchMode::Hybrid => (1.0, 2.2),
+            SearchMode::Hybrid => (1.0, 2.4),
         };
 
         // Deduplicate by file_id (keep highest-scoring chunk per file)
@@ -295,30 +344,42 @@ impl Searcher {
             if !filter.kinds.is_empty() && !filter.kinds.contains(&chunk.kind) {
                 continue;
             }
-            if let Some(ref prefix) = filter.path_prefix {
-                if !chunk.relative_path.starts_with(prefix) {
-                    continue;
-                }
+
+            let has_vec = chunk.vector_slot.is_some();
+            let z = if has_vec { z_scores[i] } else { 0.0 };
+            let raw_cos = if has_vec { raw_scores[i] as f64 } else { 0.0 };
+            let coverage = compute_lexical_coverage(
+                &query_tokens,
+                chunk,
+                fts_bm25.get(&chunk.chunk_id).copied(),
+            );
+
+            // DigUp Searcher.swift qualification gate:
+            // A candidate only qualifies if it matches lexically (`coverage > 0`) OR stands out semantically above `zGate`.
+            let semantic_standout = has_vec && ((z >= 1.55 && raw_cos >= 0.35) || raw_cos >= 0.78);
+            let qualifies = match mode {
+                SearchMode::Lexical => coverage > 0.0,
+                SearchMode::Semantic => semantic_standout,
+                SearchMode::Hybrid => coverage > 0.0 || semantic_standout,
+            };
+            if !qualifies {
+                continue;
             }
 
-            let z = z_scores[i];
-            let raw_cos = raw_scores[i] as f64;
-            let coverage = compute_lexical_coverage(&query_tokens, chunk, fts_bm25.get(&chunk.chunk_id).copied());
-
-            let hint_bonus = if kind_hints.contains(&chunk.kind) && z > 0.5 {
-                0.85
+            let sem_contrib = if has_vec && (z >= 0.45 && raw_cos >= 0.28) {
+                meaning_weight * z.max(0.0)
             } else {
                 0.0
             };
 
-            let score = meaning_weight * z.max(0.0)
-                + words_weight * coverage.powf(1.5)
-                + hint_bonus;
+            let hint_bonus = if kind_hints.contains(&chunk.kind) && (z > 0.6 || coverage > 0.0) {
+                0.75
+            } else {
+                0.0
+            };
 
-            if mode == SearchMode::Lexical && coverage <= 0.0 {
-                continue;
-            }
-            if score <= 0.05 && raw_cos <= 0.05 {
+            let score = sem_contrib + words_weight * coverage.powf(1.35) + hint_bonus;
+            if score <= 0.05 {
                 continue;
             }
 
@@ -375,21 +436,35 @@ fn compute_lexical_coverage(
     if query_tokens.is_empty() {
         return 0.0;
     }
-    let hay = SearchText::normalized(&format!(
-        "{} {} {}",
-        chunk.file_name, chunk.relative_path, chunk.text_content
+    let name_hay = SearchText::normalized(&chunk.file_name).to_lowercase();
+    let body_hay = SearchText::normalized(&format!(
+        "{} {}",
+        chunk.relative_path, chunk.text_content
     ))
     .to_lowercase();
 
     let mut matched = 0usize;
+    let mut name_matched = 0usize;
     for tok in query_tokens {
-        if hay.contains(tok.as_str()) {
+        let in_name = name_hay.contains(tok.as_str());
+        let in_body = body_hay.contains(tok.as_str());
+        if in_name {
+            name_matched += 1;
+            matched += 1;
+        } else if in_body {
             matched += 1;
         }
     }
-    let ratio = (matched as f64) / (query_tokens.len() as f64);
-    let bm25_boost = bm25.map(|b| (b / 10.0).clamp(0.0, 0.35)).unwrap_or(0.0);
-    (ratio + bm25_boost).clamp(0.0, 1.25)
+
+    if matched == 0 && bm25.is_none() {
+        return 0.0;
+    }
+
+    let n = query_tokens.len() as f64;
+    let ratio = (matched as f64) / n;
+    let name_bonus = ((name_matched as f64) / n) * 0.45;
+    let bm25_boost = bm25.map(|b| (b / 10.0).clamp(0.05, 0.35)).unwrap_or(0.0);
+    (ratio + name_bonus + bm25_boost).clamp(0.0, 1.65)
 }
 
 fn detect_kind_hints(tokens: &[String]) -> HashSet<SearchKind> {
@@ -422,3 +497,4 @@ fn detect_kind_hints(tokens: &[String]) -> HashSet<SearchKind> {
     }
     set
 }
+

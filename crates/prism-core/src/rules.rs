@@ -33,6 +33,7 @@ pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     "__pycache__",
     ".venv",
     "venv",
+    "env",
     ".tox",
     ".mypy_cache",
     ".pytest_cache",
@@ -43,7 +44,31 @@ pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".vscode",
     "Pods",
     "DerivedData",
+    "snap",
+    "site-packages",
+    "dist-packages",
+    "nltk_data",
+    "CMakeFiles",
+    "third_party",
+    "3rdparty",
+    "external",
 ];
+
+pub const IGNORED_DIR_PREFIXES: &[&str] = &[
+    "go1.",
+    "android-studio",
+    "tor-browser",
+    "scrcpy-",
+    "support_material",
+    "Comment Letters_PDF",
+    "cmake-",
+    "miniforge",
+    "miniconda",
+    "anaconda",
+];
+
+/// Maximum indexable files taken from a single directory before treating the rest as a bulk dataset (matches DigUp dataset skipping).
+pub const MAX_FILES_PER_SINGLE_DIR: usize = 250;
 
 pub const INDEX_DB_NAMES: &[&str] = &[
     ".prism.db",
@@ -126,13 +151,13 @@ pub fn classify_extension(ext: &str) -> Option<SearchKind> {
     }
 }
 
-/// Crawl a directory respecting `.gitignore`, `.digupignore`, `.prismignore`, and default exclusions.
-pub fn crawl_directory(root: &Path) -> Result<Vec<CrawledFile>> {
+fn crawl_internal(root: &Path, use_absolute_paths: bool) -> Result<Vec<CrawledFile>> {
     let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut builder = WalkBuilder::new(&canon_root);
     builder
         .hidden(true)
         .follow_links(false)
+        .max_depth(Some(8))
         .git_ignore(true)
         .git_global(false)
         .git_exclude(true)
@@ -147,11 +172,22 @@ pub fn crawl_directory(root: &Path) -> Result<Vec<CrawledFile>> {
             if DEFAULT_IGNORED_DIRS.contains(&name) || INDEX_DB_NAMES.contains(&name) {
                 return false;
             }
+            if entry
+                .file_type()
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+                && IGNORED_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
+            {
+                return false;
+            }
         }
         true
     });
 
     let mut files = Vec::new();
+    let mut per_parent_count: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
+
     for result in builder.build() {
         let Ok(entry) = result else {
             continue;
@@ -166,6 +202,13 @@ pub fn crawl_directory(root: &Path) -> Result<Vec<CrawledFile>> {
         let Some(kind) = classify_path(&path) else {
             continue;
         };
+        if let Some(parent) = path.parent() {
+            let count = per_parent_count.entry(parent.to_path_buf()).or_insert(0);
+            if *count >= MAX_FILES_PER_SINGLE_DIR {
+                continue;
+            }
+            *count += 1;
+        }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
@@ -180,11 +223,14 @@ pub fn crawl_directory(root: &Path) -> Result<Vec<CrawledFile>> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let relative_path = path
-            .strip_prefix(&canon_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative_path = if use_absolute_paths {
+            path.to_string_lossy().replace('\\', "/")
+        } else {
+            path.strip_prefix(&canon_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
         let file_name = path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -209,9 +255,38 @@ pub fn crawl_directory(root: &Path) -> Result<Vec<CrawledFile>> {
     Ok(files)
 }
 
-/// Estimate indexing cost and file breakdown for a directory.
+/// Crawl a directory respecting `.gitignore`, `.digupignore`, `.prismignore`, and default exclusions.
+pub fn crawl_directory(root: &Path) -> Result<Vec<CrawledFile>> {
+    crawl_internal(root, false)
+}
+
+/// Crawl multiple OS root directories storing canonical absolute paths in `relative_path` for the Global OS Index.
+pub fn crawl_os_roots(roots: &[PathBuf]) -> Result<Vec<CrawledFile>> {
+    let mut all_files = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    for root in roots {
+        if !root.exists() || !root.is_dir() {
+            continue;
+        }
+        if let Ok(files) = crawl_internal(root, true) {
+            for f in files {
+                if seen_paths.insert(f.relative_path.clone()) {
+                    all_files.push(f);
+                }
+            }
+        }
+    }
+    all_files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(all_files)
+}
+
+/// Estimate indexing cost and file breakdown for a directory (or ALL_OS).
 pub fn estimate_directory(root: &Path) -> Result<EstimateSummary> {
-    let files = crawl_directory(root)?;
+    let files = if crate::store::IndexStore::is_global_dir(&root.to_string_lossy()) {
+        crawl_os_roots(&crate::store::IndexStore::default_os_roots())?
+    } else {
+        crawl_directory(root)?
+    };
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut total_bytes = 0u64;
     let mut estimated_chunks = 0usize;

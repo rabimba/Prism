@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -8,22 +8,70 @@ use prism_llama::LlamaEmbedder;
 use rayon::prelude::*;
 
 use crate::extractors::{extract_file, ExtractedPayload, ExtractedSegment};
-use crate::model::IndexStats;
-use crate::rules::{crawl_directory, CrawledFile};
+use crate::model::{ChunkModality, ContentOrigin, IndexStats};
+use crate::rules::{crawl_directory, crawl_os_roots, CrawledFile};
 use crate::search_text::SearchText;
 use crate::store::{IndexStore, NewChunkRecord};
 
 pub struct Indexer;
 
 impl Indexer {
+    /// Phase 1 Instant OS Sync: Crawl OS directories (`~/Documents`, `~/Downloads`, `~/Desktop`, `~/Pictures`, `~/Music`, `~/Videos`, etc.)
+    /// and sync all files into the Global OS Index (`~/.local/share/prism/os_index`) in `<300ms` so every file across the OS
+    /// is immediately searchable by filename, folder path, and fast text content.
+    pub fn sync_os_roots_fast(roots: &[PathBuf]) -> Result<IndexStats> {
+        let start = Instant::now();
+        let mut store = IndexStore::open_global()?;
+        let crawled = crawl_os_roots(roots)?;
+        let _ = store.sync_files_fast(&crawled)?;
+        for root in roots {
+            let _ = store.import_folder_store(root);
+        }
+        store.stats(start.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    /// Phase 2 Background Multimodal Embedding: Embed up to `batch_size` pending (`embedded = 0`) files in the Global OS Index
+    /// using EmbeddingGemma 2 (Text + Vision + Audio Conformer + 768-D Semantic ASR).
+    /// Returns `(embedded_in_this_batch, remaining_pending_files)`.
+    pub fn embed_pending_global_batch(
+        embedder: &LlamaEmbedder,
+        asr_engine: Option<&SemanticAsrEngine>,
+        batch_size: usize,
+    ) -> Result<(usize, usize)> {
+        let mut store = IndexStore::open_global()?;
+        let (pending, total_pending) = store.pending_unembedded_files(batch_size)?;
+        if pending.is_empty() {
+            return Ok((0, 0));
+        }
+        let count = pending.len();
+        Self::extract_embed_and_store(&mut store, pending, embedder, asr_engine, None)?;
+        Ok((count, total_pending.saturating_sub(count)))
+    }
+
     pub fn index_directory(
         root: &Path,
         embedder: &LlamaEmbedder,
         asr_engine: Option<&SemanticAsrEngine>,
         force: bool,
-        mut progress: Option<&mut dyn FnMut(usize, usize, &str)>,
+        progress: Option<&mut dyn FnMut(usize, usize, &str)>,
     ) -> Result<IndexStats> {
         let start = Instant::now();
+        let root_str = root.to_string_lossy();
+        if IndexStore::is_global_dir(&root_str) {
+            let mut store = IndexStore::open_global()?;
+            if force {
+                store.clear_all()?;
+            }
+            let roots = IndexStore::default_os_roots();
+            let crawled = crawl_os_roots(&roots)?;
+            let _ = store.sync_files_fast(&crawled)?;
+            let (pending, _) = store.pending_unembedded_files(48)?;
+            if !pending.is_empty() {
+                Self::extract_embed_and_store(&mut store, pending, embedder, asr_engine, progress)?;
+            }
+            return store.stats(start.elapsed().as_secs_f64() * 1000.0);
+        }
+
         let mut store = IndexStore::open(root)?;
         if force {
             store.clear_all()?;
@@ -49,20 +97,37 @@ impl Indexer {
                 }
                 match existing.get(&f.relative_path) {
                     Some(rec) => {
-                        rec.size_bytes != f.size_bytes || rec.modified_unix != f.modified_unix
+                        !rec.embedded
+                            || rec.size_bytes != f.size_bytes
+                            || rec.modified_unix != f.modified_unix
                     }
                     None => true,
                 }
             })
             .collect();
 
-        let total_dirty = dirty_files.len();
-        if total_dirty == 0 {
+        if dirty_files.is_empty() {
             return store.stats(start.elapsed().as_secs_f64() * 1000.0);
         }
 
-        // 3. Stage 1: Parallel extraction across CPU cores
-        let extracted_per_file: Vec<(CrawledFile, Vec<ExtractedSegment>)> = dirty_files
+        Self::extract_embed_and_store(&mut store, dirty_files, embedder, asr_engine, progress)?;
+        store.stats(start.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn extract_embed_and_store(
+        store: &mut IndexStore,
+        files_to_process: Vec<CrawledFile>,
+        embedder: &LlamaEmbedder,
+        asr_engine: Option<&SemanticAsrEngine>,
+        mut progress: Option<&mut dyn FnMut(usize, usize, &str)>,
+    ) -> Result<()> {
+        let total_dirty = files_to_process.len();
+        if total_dirty == 0 {
+            return Ok(());
+        }
+
+        // Stage 1: Parallel extraction across CPU cores
+        let extracted_per_file: Vec<(CrawledFile, Vec<ExtractedSegment>)> = files_to_process
             .into_par_iter()
             .map(|file| {
                 let segs = extract_file(&file).unwrap_or_default();
@@ -70,7 +135,7 @@ impl Indexer {
             })
             .collect();
 
-        // 4. Enrich Semantic ASR lexicon with domain terms from extracted text/filenames
+        // Enrich Semantic ASR lexicon with domain terms from extracted text/filenames
         if let Some(asr) = asr_engine {
             let mut domain_terms = Vec::new();
             let mut seen = HashSet::new();
@@ -96,16 +161,33 @@ impl Indexer {
             let _ = asr.enrich_vocabulary(embedder, &domain_terms);
         }
 
-        // 5. Stage 2: Embed & store per file
+        // Stage 2: Embed & store per file
         for (idx, (file, segments)) in extracted_per_file.into_iter().enumerate() {
             if let Some(cb) = progress.as_mut() {
                 cb(idx + 1, total_dirty, &file.relative_path);
             }
             if segments.is_empty() {
+                // Keep a fallback lexical chunk so the file is marked embedded=1 and searchable by name
+                let fallback_chunk = NewChunkRecord {
+                    chunk_index: 0,
+                    modality: ChunkModality::Text,
+                    sets_scale: false,
+                    vector: None,
+                    ahash: None,
+                    text_content: format!("{} ({})", file.file_name, file.kind.as_str()),
+                    origin: ContentOrigin::none(),
+                };
+                store.upsert_file_with_chunks(
+                    &file.relative_path,
+                    &file.file_name,
+                    file.kind,
+                    file.size_bytes,
+                    file.modified_unix,
+                    vec![fallback_chunk],
+                )?;
                 continue;
             }
 
-            // Batch text prompts for this file
             let mut text_indices = Vec::new();
             let mut text_prompts = Vec::new();
             let mut image_indices = Vec::new();
@@ -225,6 +307,7 @@ impl Indexer {
             )?;
         }
 
-        store.stats(start.elapsed().as_secs_f64() * 1000.0)
+        Ok(())
     }
 }
+

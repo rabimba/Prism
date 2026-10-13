@@ -25,17 +25,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Crawl a folder and estimate indexing cost and file breakdown
+    /// Crawl a folder (or ALL_OS) and estimate indexing cost and file breakdown
     Estimate {
-        #[arg(default_value = ".")]
+        #[arg(default_value = "ALL_OS")]
         dir: PathBuf,
         #[arg(long)]
         json: bool,
     },
 
-    /// Index a folder using EmbeddingGemma 2 (Text + Vision + Audio + Semantic ASR)
+    /// Index a folder (or ALL_OS across Documents, Downloads, Desktop, Pictures, Music, Videos) using EmbeddingGemma 2
     Index {
-        #[arg(default_value = ".")]
+        #[arg(default_value = "ALL_OS")]
         dir: PathBuf,
         #[arg(long)]
         force: bool,
@@ -43,12 +43,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Search an indexed folder by text, spoken audio, microphone, or multimodal file
+    /// Search across the entire operating system (or a specific folder with -d) by text, spoken audio, microphone, or multimodal file
     Search {
         /// Optional text query
         query: Option<String>,
-        /// Target indexed directory
-        #[arg(short = 'd', long, default_value = ".")]
+        /// Target indexed directory (default: ALL_OS for OS-wide search)
+        #[arg(short = 'd', long, default_value = "ALL_OS")]
         dir: PathBuf,
         /// Search using a spoken audio file (WAV, MP3, M4A, FLAC, OGG)
         #[arg(long)]
@@ -82,8 +82,8 @@ enum Commands {
         /// Raw text passage to check for containment
         #[arg(long)]
         text: Option<String>,
-        /// Target indexed directory
-        #[arg(short = 'd', long, default_value = ".")]
+        /// Target indexed directory (default: ALL_OS)
+        #[arg(short = 'd', long, default_value = "ALL_OS")]
         dir: PathBuf,
         /// Max candidate parent files to return
         #[arg(short = 'n', long, default_value_t = 8)]
@@ -108,9 +108,9 @@ enum Commands {
         json: bool,
     },
 
-    /// Show index statistics for a folder
+    /// Show index statistics for the OS-wide index or a specific folder
     Status {
-        #[arg(default_value = ".")]
+        #[arg(default_value = "ALL_OS")]
         dir: PathBuf,
         #[arg(long)]
         json: bool,
@@ -263,6 +263,13 @@ fn main() -> Result<()> {
                 path_prefix: None,
                 limit,
             };
+
+            if IndexStore::is_global_dir(&dir.to_string_lossy()) {
+                let global = IndexStore::open_global()?;
+                if global.stats(0.0)?.indexed_files == 0 {
+                    let _ = Indexer::sync_os_roots_fast(&IndexStore::default_os_roots());
+                }
+            }
 
             let searcher = Searcher::open(&dir)?;
 
@@ -501,8 +508,14 @@ fn main() -> Result<()> {
         }
 
         Commands::Status { dir, json } => {
-            let store = IndexStore::open(&dir)?;
-            let stats = store.stats(0.0)?;
+            if IndexStore::is_global_dir(&dir.to_string_lossy()) {
+                let global = IndexStore::open_global()?;
+                if global.stats(0.0)?.indexed_files == 0 {
+                    let _ = Indexer::sync_os_roots_fast(&IndexStore::default_os_roots());
+                }
+            }
+            let (store, scope) = IndexStore::open_target(&dir.to_string_lossy())?;
+            let stats = store.stats_scoped(scope.as_deref(), 0.0)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {

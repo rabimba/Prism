@@ -208,7 +208,7 @@ pub fn compute_modality_z_scores(
         return Vec::new();
     }
 
-    const MIN_MODALITY_COUNT: usize = 20;
+    const MIN_MODALITY_COUNT: usize = 2;
     const MIN_STD_DEV: f64 = 0.02;
 
     let mut sums = [0.0f64; 4];

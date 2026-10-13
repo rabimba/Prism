@@ -48,8 +48,11 @@ const WEAKER_ID = "__weaker_toggle__";
 const TYPING_PAUSE_MS = 120;
 
 const state = {
-  activeDir: "/tmp/prism_live_demo/corpus",
+  activeDir: "ALL_OS",
   stats: null,
+  pendingEmbeddings: 0,
+  bgTimer: null,
+  bgRunning: false,
   presets: [],
   demoProbes: [],
   kindCounts: {},
@@ -276,10 +279,49 @@ async function switchActiveFolder(newDir) {
 
 function updateFooterStatus() {
   if (!state.stats) {
-    $footerFolderText.textContent = state.activeDir;
+    $footerFolderText.textContent = state.activeDir === "ALL_OS" ? "🌐 Whole Operating System" : state.activeDir;
     return;
   }
-  $footerFolderText.textContent = `Up to date · ${state.stats.indexed_files} files (${state.stats.total_chunks} chunks) in ${state.activeDir}`;
+  const scopeLabel =
+    state.activeDir === "ALL_OS"
+      ? "🌐 Whole Operating System (Documents, Downloads, Pictures, Videos, Music, Desktop)"
+      : state.activeDir;
+  if (state.pendingEmbeddings > 0) {
+    $statusDot.classList.add("busy");
+    $footerFolderText.textContent = `${state.stats.indexed_files} files searchable (${state.stats.total_chunks} chunks) · embedding ${state.pendingEmbeddings} in background · ${scopeLabel}`;
+  } else {
+    $statusDot.classList.remove("busy");
+    $footerFolderText.textContent = `Up to date · ${state.stats.indexed_files} files (${state.stats.total_chunks} chunks) · ${scopeLabel}`;
+  }
+}
+
+function scheduleBackgroundEmbedStep(delayMs = 1800) {
+  clearTimeout(state.bgTimer);
+  if (state.pendingEmbeddings <= 0) return;
+  state.bgTimer = setTimeout(async () => {
+    if (state.timer || state.bgRunning) {
+      scheduleBackgroundEmbedStep(2000);
+      return;
+    }
+    state.bgRunning = true;
+    try {
+      const prog = await invoke("embed_os_step", {
+        dir: state.activeDir,
+        batchSize: 2,
+      });
+      state.pendingEmbeddings = prog.remaining_pending || 0;
+      if (prog.stats) {
+        state.stats = prog.stats;
+      }
+      updateFooterStatus();
+      if (state.pendingEmbeddings > 0) {
+        scheduleBackgroundEmbedStep(1200);
+      }
+    } catch (_) {
+    } finally {
+      state.bgRunning = false;
+    }
+  }, delayMs);
 }
 
 // Instant lexical + 120ms hybrid search pipeline (matches panel.js)
@@ -1158,6 +1200,7 @@ async function initApp() {
     const init = await invoke("get_initial_state");
     state.activeDir = init.active_dir;
     state.stats = init.stats;
+    state.pendingEmbeddings = init.pending_embeddings || 0;
     state.presets = init.presets || [];
     state.demoProbes = init.demo_probes || [];
     state.kindCounts = init.kind_counts || {};
@@ -1173,6 +1216,8 @@ async function initApp() {
     const testMode = await invoke("get_ui_test_mode");
     if (testMode) {
       await runAutomatedUiTest(testMode);
+    } else if (state.pendingEmbeddings > 0) {
+      scheduleBackgroundEmbedStep(1500);
     }
   } catch (err) {
     $footerSummary.textContent = `Initialization error: ${err}`;
@@ -1190,19 +1235,31 @@ async function runAutomatedUiTest(mode) {
     const reason = $previewContent.querySelector(".facts .reason span")?.textContent || null;
     const banner = !$statusBanner.classList.contains("hidden") ? $statusBanner.textContent.trim().replace(/\s+/g, " ") : null;
     const footer = $footerSummary.textContent;
-    return { stepName, viewMode: state.viewMode, groups, rows, selectedTitle, reason, banner, footer };
+    return { stepName, query: $queryInput.value, viewMode: state.viewMode, groups, rows: rows.slice(0, 8), totalRows: rows.length, selectedTitle, reason, banner, footer };
   };
 
   const steps = [];
-  steps.push(snapshotDom("1_initial_browse_split_view"));
+  steps.push(snapshotDom("1_initial_os_wide_browse"));
 
-  // Step 2: Hybrid Text Search
+  // Step 2: Real OS-Wide File Search (searching user's real OS files in ~/Downloads & ~/Documents)
+  $queryInput.value = "PhD Proposal";
+  await triggerSearchNow();
+  await sleep(400);
+  steps.push(snapshotDom("2_os_wide_real_files_search"));
+
+  // Step 3: Non-matching query qualification gate test (must return 0 false-positive hits!)
+  $queryInput.value = "zzzznotfound99999xyz";
+  await triggerSearchNow();
+  await sleep(300);
+  steps.push(snapshotDom("3_qualification_gate_zero_false_positives"));
+
+  // Step 4: Hybrid Text Search (Multimodal 768-D + Lexical)
   $queryInput.value = "quantum error correction logical qubits";
   await triggerSearchNow();
-  await sleep(500);
-  steps.push(snapshotDom("2_hybrid_text_search"));
+  await sleep(400);
+  steps.push(snapshotDom("4_hybrid_text_search"));
 
-  // Step 3: Spoken Audio Search + 768-D Semantic-Space ASR Drawer
+  // Step 5: Spoken Audio Search + 768-D Semantic-Space ASR Drawer
   $voiceDrawerBtn.click();
   const demoAudio = "/tmp/prism_live_demo/probes/probe_audio_excerpt.wav";
   document.getElementById("audioPathInput").value = demoAudio;
@@ -1214,16 +1271,16 @@ async function runAutomatedUiTest(mode) {
   });
   applySearchResponse(audioResp, "meaning");
   await inspectAudioAsr(demoAudio);
-  await sleep(500);
-  steps.push(snapshotDom("3_voice_search_and_semantic_asr"));
+  await sleep(400);
+  steps.push(snapshotDom("5_voice_search_and_semantic_asr"));
 
-  // Step 4: Part-of-File Containment Verification (Video clip inside lecture_demo.mp4)
+  // Step 6: Part-of-File Containment Verification (Video clip inside lecture_demo.mp4)
   $containDrawerBtn.click();
   const demoVideoProbe = "/tmp/prism_live_demo/probes/probe_video_clip.mp4";
   document.getElementById("containFileInput").value = demoVideoProbe;
   await runFileContainment(demoVideoProbe);
-  await sleep(600);
-  steps.push(snapshotDom("4_part_of_file_video_containment"));
+  await sleep(500);
+  steps.push(snapshotDom("6_part_of_file_video_containment"));
 
   if (mode === "stay") {
     return;
@@ -1234,6 +1291,8 @@ async function runAutomatedUiTest(mode) {
       ok: true,
       active_dir: state.activeDir,
       indexed_files: state.stats?.indexed_files || 0,
+      total_chunks: state.stats?.total_chunks || 0,
+      kind_counts: state.kindCounts,
       steps,
     },
   });

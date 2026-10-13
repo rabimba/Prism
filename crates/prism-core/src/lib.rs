@@ -15,8 +15,11 @@ pub use model::{
     EstimateSummary, IndexStats, Landmark, SearchFilter, SearchHit, SearchKind, SearchMode,
     SearchResponse,
 };
-pub use rules::{classify_extension, classify_path, crawl_directory, estimate_directory, CrawledFile};
+pub use rules::{
+    classify_extension, classify_path, crawl_directory, crawl_os_roots, estimate_directory,
+    CrawledFile,
+};
 pub use search_text::{PageTextProblem, SearchText};
 pub use searcher::Searcher;
-pub use store::{IndexStore, DB_FILENAME, VECTORS_FILENAME};
+pub use store::{IndexStore, ALL_OS_SCOPE, DB_FILENAME, VECTORS_FILENAME};
 pub use vectors::{compute_modality_z_scores, VectorStore, VECTOR_BYTES, VECTOR_DIM};

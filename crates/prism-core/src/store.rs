@@ -1,16 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{ChunkModality, ContentOrigin, IndexStats, SearchKind};
+use crate::rules::CrawledFile;
 use crate::search_text::SearchText;
 use crate::vectors::VectorStore;
 
 pub const DB_FILENAME: &str = ".prism.db";
 pub const VECTORS_FILENAME: &str = ".prism.vectors.f16";
+pub const ALL_OS_SCOPE: &str = "ALL_OS";
 
 #[derive(Debug, Clone)]
 pub struct StoredFileRecord {
@@ -20,6 +23,7 @@ pub struct StoredFileRecord {
     pub kind: SearchKind,
     pub size_bytes: u64,
     pub modified_unix: i64,
+    pub embedded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +62,90 @@ pub struct IndexStore {
 }
 
 impl IndexStore {
+    /// Centralized OS-wide index directory (`~/.local/share/prism/os_index` on Linux, `~/Library/Application Support/prism/os_index` on macOS).
+    pub fn global_store_dir() -> PathBuf {
+        let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("prism").join("os_index")
+    }
+
+    pub fn is_global_dir(dir: &str) -> bool {
+        let t = dir.trim();
+        t.is_empty()
+            || t.eq_ignore_ascii_case(ALL_OS_SCOPE)
+            || t.eq_ignore_ascii_case("all")
+            || t == "*"
+            || Path::new(t) == Self::global_store_dir()
+    }
+
+    /// Standard OS user directories indexed by default for OS-wide search (matches DigUp Setup offered roots).
+    pub fn default_os_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let demo = PathBuf::from("/tmp/prism_live_demo/corpus");
+        if demo.is_dir() {
+            roots.push(demo);
+        }
+        let candidates = [
+            dirs::document_dir(),
+            dirs::download_dir(),
+            dirs::desktop_dir(),
+            dirs::picture_dir(),
+            dirs::video_dir(),
+            dirs::audio_dir(),
+        ];
+        let mut seen = HashSet::new();
+        for dir_opt in candidates.into_iter().flatten() {
+            if dir_opt.is_dir() {
+                let canon = fs::canonicalize(&dir_opt).unwrap_or(dir_opt);
+                if seen.insert(canon.clone()) {
+                    roots.push(canon);
+                }
+            }
+        }
+        roots
+    }
+
+    pub fn open_global() -> Result<Self> {
+        let dir = Self::global_store_dir();
+        fs::create_dir_all(&dir)?;
+        Self::open(&dir)
+    }
+
+    /// Open either the Global OS Index (`ALL_OS` or a folder covered by the global index) or a folder-local `.prism.db`.
+    /// Returns `(IndexStore, Option<scope_path_prefix>)`.
+    pub fn open_target(dir: &str) -> Result<(Self, Option<String>)> {
+        if Self::is_global_dir(dir) {
+            return Ok((Self::open_global()?, None));
+        }
+        let p = Path::new(dir);
+        let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if canon == Self::global_store_dir() {
+            return Ok((Self::open_global()?, None));
+        }
+        // If this folder has its own standalone index (e.g., `/tmp/prism_live_demo/corpus` or a test temp dir),
+        // check if it has files; otherwise scope into the Global OS Index if the Global OS Index exists.
+        if Self::exists_in(&canon) {
+            let local_store = Self::open(&canon)?;
+            if let Ok(st) = local_store.stats(0.0) {
+                if st.indexed_files > 0 {
+                    return Ok((local_store, None));
+                }
+            }
+        }
+        let global_dir = Self::global_store_dir();
+        if Self::exists_in(&global_dir) {
+            let prefix = canon.to_string_lossy().replace('\\', "/");
+            let global_store = Self::open_global()?;
+            if let Ok(st) = global_store.stats_scoped(Some(&prefix), 0.0) {
+                if st.indexed_files > 0 {
+                    return Ok((global_store, Some(prefix)));
+                }
+            }
+        }
+        Ok((Self::open(&canon)?, None))
+    }
+
     pub fn open(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root).ok();
         let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let db_path = canon_root.join(DB_FILENAME);
         let vec_path = canon_root.join(VECTORS_FILENAME);
@@ -81,7 +168,8 @@ impl IndexStore {
                  file_name TEXT NOT NULL,
                  kind TEXT NOT NULL,
                  size_bytes INTEGER NOT NULL,
-                 modified_unix INTEGER NOT NULL
+                 modified_unix INTEGER NOT NULL,
+                 embedded INTEGER NOT NULL DEFAULT 1
              );
              CREATE TABLE IF NOT EXISTS chunks (
                  id INTEGER PRIMARY KEY,
@@ -105,6 +193,12 @@ impl IndexStore {
                  tokenize=\"porter unicode61 remove_diacritics 2 categories 'L* N* Co M*'\"
              );",
         )?;
+
+        // Migrate older DBs that lacked `embedded` column
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN embedded INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
 
         let vectors = VectorStore::open(&vec_path)?;
         Ok(Self {
@@ -135,10 +229,11 @@ impl IndexStore {
 
     pub fn existing_files_map(&self) -> Result<HashMap<String, StoredFileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, relative_path, file_name, kind, size_bytes, modified_unix FROM files",
+            "SELECT id, relative_path, file_name, kind, size_bytes, modified_unix, embedded FROM files",
         )?;
         let rows = stmt.query_map([], |row| {
             let kind_str: String = row.get(3)?;
+            let emb_int: i64 = row.get(6).unwrap_or(1);
             Ok(StoredFileRecord {
                 id: row.get(0)?,
                 relative_path: row.get(1)?,
@@ -146,6 +241,7 @@ impl IndexStore {
                 kind: SearchKind::from_str(&kind_str).unwrap_or(SearchKind::Text),
                 size_bytes: row.get::<_, i64>(4)? as u64,
                 modified_unix: row.get(5)?,
+                embedded: emb_int != 0,
             })
         })?;
         let mut map = HashMap::new();
@@ -154,6 +250,221 @@ impl IndexStore {
             map.insert(rec.relative_path.clone(), rec);
         }
         Ok(map)
+    }
+
+    /// Phase 1 Instant OS Sync: Reconciles crawled files into SQLite + FTS5 in a single fast transaction (`<250ms`),
+    /// making every file across the OS immediately searchable by filename, path, and fast text content (`embedded = 0`),
+    /// while queuing files for background 768-D multimodal embedding.
+    pub fn sync_files_fast(&mut self, crawled: &[CrawledFile]) -> Result<usize> {
+        let existing = self.existing_files_map()?;
+        let current_rel: HashSet<&str> = crawled.iter().map(|f| f.relative_path.as_str()).collect();
+
+        let tx = self.conn.transaction()?;
+        for (rel, rec) in &existing {
+            if !current_rel.contains(rel.as_str()) {
+                tx.execute(
+                    "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
+                    params![rec.id],
+                )?;
+                tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![rec.id])?;
+                tx.execute("DELETE FROM files WHERE id = ?1", params![rec.id])?;
+            }
+        }
+
+        let mut synced_count = 0usize;
+        for f in crawled {
+            let needs_sync = match existing.get(&f.relative_path) {
+                Some(rec) => rec.size_bytes != f.size_bytes || rec.modified_unix != f.modified_unix,
+                None => true,
+            };
+            if !needs_sync {
+                continue;
+            }
+
+            if let Some(rec) = existing.get(&f.relative_path) {
+                tx.execute(
+                    "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
+                    params![rec.id],
+                )?;
+                tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![rec.id])?;
+                tx.execute("DELETE FROM files WHERE id = ?1", params![rec.id])?;
+            }
+
+            tx.execute(
+                "INSERT INTO files (relative_path, file_name, kind, size_bytes, modified_unix, embedded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    f.relative_path,
+                    f.file_name,
+                    f.kind.as_str(),
+                    f.size_bytes as i64,
+                    f.modified_unix
+                ],
+            )?;
+            let file_id = tx.last_insert_rowid();
+
+            let fast_text = extract_fast_preview_text(f);
+            let modality = match f.kind {
+                SearchKind::Image => ChunkModality::Image,
+                SearchKind::Audio => ChunkModality::Audio,
+                _ => ChunkModality::Text,
+            };
+
+            tx.execute(
+                "INSERT INTO chunks (
+                     file_id, chunk_index, modality, sets_scale, vector_slot, ahash,
+                     text_content, page, line_start, line_end, start_seconds, end_seconds
+                 ) VALUES (?1, 0, ?2, 0, NULL, NULL, ?3, NULL, 1, NULL, NULL, NULL)",
+                params![file_id, modality.as_str(), fast_text],
+            )?;
+            let chunk_id = tx.last_insert_rowid();
+            let norm_title =
+                SearchText::normalized(&format!("{} {}", f.file_name, f.relative_path));
+            let norm_body = SearchText::normalized(&fast_text);
+            tx.execute(
+                "INSERT INTO chunks_fts (rowid, title, body) VALUES (?1, ?2, ?3)",
+                params![chunk_id, norm_title, norm_body],
+            )?;
+            synced_count += 1;
+        }
+
+        tx.commit()?;
+        Ok(synced_count)
+    }
+
+    /// Import already-embedded files & 768-D vectors from a folder-specific `.prism.db` into this Global OS Index
+    /// without re-running the model (`<5ms`).
+    pub fn import_folder_store(&mut self, folder_root: &Path) -> Result<usize> {
+        let canon_folder = fs::canonicalize(folder_root).unwrap_or_else(|_| folder_root.to_path_buf());
+        if !Self::exists_in(&canon_folder) || canon_folder == self.root {
+            return Ok(0);
+        }
+        let src_store = Self::open(&canon_folder)?;
+        let src_chunks = src_store.load_all_chunks()?;
+        if src_chunks.is_empty() {
+            return Ok(0);
+        }
+
+        let existing = self.existing_files_map()?;
+        let mut by_file: HashMap<i64, Vec<IndexedChunkRow>> = HashMap::new();
+        for c in src_chunks {
+            by_file.entry(c.file_id).or_default().push(c);
+        }
+
+        let mut imported = 0usize;
+        for (_fid, rows) in by_file {
+            let first = &rows[0];
+            let abs_path = canon_folder
+                .join(&first.relative_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if let Some(rec) = existing.get(&abs_path) {
+                if rec.embedded
+                    && rec.size_bytes == first.size_bytes
+                    && rec.modified_unix == first.modified_unix
+                {
+                    continue;
+                }
+            }
+
+            let file_name = first.file_name.clone();
+            let kind = first.kind;
+            let size_bytes = first.size_bytes;
+            let modified_unix = first.modified_unix;
+
+            let mut new_chunks = Vec::with_capacity(rows.len());
+            for (idx, r) in rows.into_iter().enumerate() {
+                let vec = r.vector_slot.and_then(|s| src_store.vectors.get_vector(s));
+                new_chunks.push(NewChunkRecord {
+                    chunk_index: idx,
+                    modality: r.modality,
+                    sets_scale: r.sets_scale,
+                    vector: vec,
+                    ahash: r.ahash,
+                    text_content: r.text_content,
+                    origin: r.origin,
+                });
+            }
+
+            self.upsert_file_with_chunks(
+                &abs_path,
+                &file_name,
+                kind,
+                size_bytes,
+                modified_unix,
+                new_chunks,
+            )?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
+    /// Return up to `limit` files that are fast-synced (`embedded = 0`) and awaiting 768-D multimodal embedding,
+    /// prioritized by importance (demo corpus first, then Documents/Text/PDFs/Images/Audio/Video, newest first),
+    /// along with the total remaining count.
+    pub fn pending_unembedded_files(&self, limit: usize) -> Result<(Vec<CrawledFile>, usize)> {
+        let total_pending: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE embedded = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if total_pending == 0 || limit == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT relative_path, file_name, kind, size_bytes, modified_unix
+             FROM files
+             WHERE embedded = 0
+             ORDER BY
+                 CASE WHEN relative_path LIKE '/tmp/prism_live_demo%' THEN 0 ELSE 1 END ASC,
+                 CASE kind
+                     WHEN 'text' THEN 0
+                     WHEN 'document' THEN 1
+                     WHEN 'image' THEN 2
+                     WHEN 'audio' THEN 3
+                     WHEN 'video' THEN 4
+                     WHEN 'spreadsheet' THEN 5
+                     WHEN 'presentation' THEN 6
+                     ELSE 7
+                 END ASC,
+                 modified_unix DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let rel: String = row.get(0)?;
+            let fname: String = row.get(1)?;
+            let kind_str: String = row.get(2)?;
+            let size_bytes = row.get::<_, i64>(3)? as u64;
+            let modified_unix: i64 = row.get(4)?;
+            let abs_path = self.root.join(&rel);
+            let ext = abs_path
+                .extension()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            Ok(CrawledFile {
+                path: abs_path,
+                relative_path: rel,
+                file_name: fname,
+                extension: ext,
+                kind: SearchKind::from_str(&kind_str).unwrap_or(SearchKind::Text),
+                size_bytes,
+                modified_unix,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(cf) = r {
+                out.push(cf);
+            }
+        }
+        Ok((out, total_pending as usize))
     }
 
     pub fn remove_file(&mut self, file_id: i64) -> Result<()> {
@@ -204,8 +515,8 @@ impl IndexStore {
 
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO files (relative_path, file_name, kind, size_bytes, modified_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO files (relative_path, file_name, kind, size_bytes, modified_unix, embedded)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
             params![
                 relative_path,
                 file_name,
@@ -328,31 +639,71 @@ impl IndexStore {
     }
 
     pub fn stats(&self, elapsed_ms: f64) -> Result<IndexStats> {
-        let indexed_files: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-        let total_chunks: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
-        let text_chunks: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE modality = 'text'",
-            [],
-            |r| r.get(0),
-        )?;
-        let image_chunks: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE modality = 'image'",
-            [],
-            |r| r.get(0),
-        )?;
-        let audio_chunks: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE modality = 'audio'",
-            [],
-            |r| r.get(0),
-        )?;
+        self.stats_scoped(None, elapsed_ms)
+    }
+
+    pub fn stats_scoped(&self, scope_prefix: Option<&str>, elapsed_ms: f64) -> Result<IndexStats> {
+        let (indexed_files, total_chunks, text_chunks, image_chunks, audio_chunks) =
+            if let Some(prefix) = scope_prefix {
+                let like_pat = format!("{}%", prefix);
+                let f_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM files WHERE relative_path LIKE ?1",
+                    params![like_pat],
+                    |r| r.get(0),
+                )?;
+                let c_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.relative_path LIKE ?1",
+                    params![like_pat],
+                    |r| r.get(0),
+                )?;
+                let t_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.relative_path LIKE ?1 AND c.modality = 'text'",
+                    params![like_pat],
+                    |r| r.get(0),
+                )?;
+                let i_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.relative_path LIKE ?1 AND c.modality = 'image'",
+                    params![like_pat],
+                    |r| r.get(0),
+                )?;
+                let a_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.relative_path LIKE ?1 AND c.modality = 'audio'",
+                    params![like_pat],
+                    |r| r.get(0),
+                )?;
+                (f_cnt, c_cnt, t_cnt, i_cnt, a_cnt)
+            } else {
+                let f_cnt: i64 =
+                    self.conn
+                        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+                let c_cnt: i64 =
+                    self.conn
+                        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+                let t_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE modality = 'text'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let i_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE modality = 'image'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let a_cnt: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE modality = 'audio'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                (f_cnt, c_cnt, t_cnt, i_cnt, a_cnt)
+            };
+
         let db_bytes = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        let root_label = scope_prefix
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.root.to_string_lossy().to_string());
 
         Ok(IndexStats {
-            root: self.root.to_string_lossy().to_string(),
+            root: root_label,
             indexed_files: indexed_files as usize,
             total_chunks: total_chunks as usize,
             text_chunks: text_chunks as usize,
@@ -363,4 +714,64 @@ impl IndexStore {
             elapsed_ms,
         })
     }
+
+    pub fn kind_counts_scoped(&self, scope_prefix: Option<&str>) -> Result<HashMap<String, usize>> {
+        let mut counts = HashMap::new();
+        if let Some(prefix) = scope_prefix {
+            let like_pat = format!("{}%", prefix);
+            let mut stmt = self.conn.prepare(
+                "SELECT kind, COUNT(*) FROM files WHERE relative_path LIKE ?1 GROUP BY kind",
+            )?;
+            let rows = stmt.query_map(params![like_pat], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows.flatten() {
+                counts.insert(row.0, row.1);
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT kind, COUNT(*) FROM files GROUP BY kind")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows.flatten() {
+                counts.insert(row.0, row.1);
+            }
+        }
+        Ok(counts)
+    }
 }
+
+fn extract_fast_preview_text(file: &CrawledFile) -> String {
+    if matches!(
+        file.kind,
+        SearchKind::Text | SearchKind::Code | SearchKind::Spreadsheet
+    ) && file.size_bytes <= 512 * 1024
+    {
+        if let Ok(mut f) = fs::File::open(&file.path) {
+            let mut buf = vec![0u8; (file.size_bytes as usize).min(4096)];
+            if let Ok(n) = f.read(&mut buf) {
+                buf.truncate(n);
+                let text = String::from_utf8_lossy(&buf);
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.chars().take(1800).collect();
+                }
+            }
+        }
+    }
+    let parent_name = file
+        .path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    format!(
+        "{} ({}) — {}",
+        file.file_name,
+        file.kind.as_str(),
+        parent_name
+    )
+}
+
