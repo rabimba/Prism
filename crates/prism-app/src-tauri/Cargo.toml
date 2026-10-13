@@ -13,10 +13,12 @@ tauri-build = { version = "2", features = [] }
 prism-llama = { path = "../../prism-llama" }
 prism-asr = { path = "../../prism-asr" }
 prism-core = { path = "../../prism-core" }
-anyhow = "1.0"
-parking_lot = "0.12"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tauri = { version = "2", features = ["protocol-asset"] }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+image = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"

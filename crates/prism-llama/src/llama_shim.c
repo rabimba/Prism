@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -20,6 +21,20 @@ void prism_llama_init_backend(void) {
     mtmd_helper_log_set(prism_silent_log, NULL);
     if (ggml_backend_dev_count() == 0) {
         ggml_backend_load_all();
+    }
+    if (ggml_backend_dev_count() == 0) {
+        const char * env_dir = getenv("PRISM_LIB_DIR");
+        if (env_dir && env_dir[0] != '\0') {
+            ggml_backend_load_all_from_path(env_dir);
+        }
+    }
+    if (ggml_backend_dev_count() == 0) {
+        const char * home = getenv("HOME");
+        if (home && home[0] != '\0') {
+            char user_lib[1024];
+            snprintf(user_lib, sizeof(user_lib), "%s/.local/lib/prism", home);
+            ggml_backend_load_all_from_path(user_lib);
+        }
     }
 #ifdef PRISM_LLAMA_LIB_DIR
     if (ggml_backend_dev_count() == 0) {

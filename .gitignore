@@ -4,6 +4,7 @@
 
 # Vendor binaries & headers (fetched via ./scripts/fetch-vendor.sh and ./scripts/build-llama.sh)
 /Vendor/
+/dist/
 
 # Local Prism & legacy index files
 .prism.db

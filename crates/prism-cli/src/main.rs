@@ -20,7 +20,7 @@ use serde_json::json;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -130,12 +130,43 @@ enum Commands {
 
     /// Run a persistent JSON-RPC worker over stdio keeping models hot in memory
     Worker,
+
+    /// Launch the Prism desktop GUI (Spotlight-style split view + visual grid + preview inspector)
+    Gui {
+        /// Optional folder to open in the GUI
+        dir: Option<PathBuf>,
+    },
+}
+
+fn launch_gui(dir: Option<PathBuf>) -> Result<()> {
+    let exe_sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("prism-app")));
+    let bin = if let Some(ref p) = exe_sibling {
+        if p.exists() {
+            p.clone()
+        } else {
+            PathBuf::from("prism-app")
+        }
+    } else {
+        PathBuf::from("prism-app")
+    };
+    let mut cmd = std::process::Command::new(bin);
+    if let Some(d) = dir {
+        cmd.arg(d);
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        anyhow::bail!("prism-app exited with status {}", status);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match cli.command.unwrap_or(Commands::Gui { dir: None }) {
+        Commands::Gui { dir } => launch_gui(dir)?,
         Commands::Estimate { dir, json } => {
             let summary = estimate_directory(&dir)?;
             if json {

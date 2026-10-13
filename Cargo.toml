@@ -5,8 +5,6 @@ members = [
     "crates/prism-asr",
     "crates/prism-core",
     "crates/prism-cli",
-]
-exclude = [
     "crates/prism-app/src-tauri",
 ]
 

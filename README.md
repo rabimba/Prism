@@ -48,37 +48,57 @@ Pass **any Image, Video clip, Audio clip, Document, or Text passage** to verify 
 - **CMake** + **Ninja** + C/C++ compiler (`clang` or `gcc`)
 - **FFmpeg** (`ffmpeg` and `ffprobe` on `PATH` for audio/video/HEIC/AVIF decoding)
 
-### Build
+### Single-Script Install or Portable Bundle
 ```bash
-./build.sh
+# Option A: Build & install Prism CLI + Native Desktop GUI + Desktop Launcher + Models in one command
+./install.sh
+
+# Option B: Build a self-contained portable bundle in dist/ (tar.gz with install-bundle.sh / macOS .app)
+./install.sh --bundle
+
+# Option C: Do both (install locally AND generate distributable bundle in dist/)
+./install.sh --all
 ```
-This automatically fetches `Vendor/pdfium`, builds patched `llama.cpp` + `mtmd` into `Vendor/llama` (with Metal on macOS or CPU/SIMD on Linux), and compiles `target/release/prism`.
+
+### Launch Native Desktop GUI
+```bash
+# Launch the Spotlight-style Split View & Visual Grid Desktop App
+prism gui
+# (or launch directly via `prism-app /path/to/folder`, or from your OS Application Launcher)
+```
+The **Prism Desktop GUI** (`prism-app`) provides:
+- **Spotlight-Style Grouped Split View & Visual Grid Toggle**: Instant `<3ms` FTS5 keyword search on every keystroke followed by `120ms` debounced 768-D EmbeddingGemma 2 hybrid semantic ranking, with collapsible weaker matches.
+- **Kind Filter Chips with Live Counts**: Filter by `All`, `Images`, `Videos`, `Audio`, `Documents`, `PDFs & Office`, or `Code` (or prefix queries with `code:`).
+- **Right-Hand Live Media & Passage Inspector**: View high-resolution images, click video frame matches (`▶ Play from MM:SS`) to play inline from the exact matched timestamp, listen to audio matches with 1-click 768-D Semantic-Space ASR timeline inspection, or read full text/code passages with `<mark>` keyword highlights and natural-language *"Why it matched"* explanations.
+- **🎙️ Voice / 768-D Semantic-Space ASR Drawer**: Record live voice queries from your microphone or run audio files through EmbeddingGemma 2's Conformer encoder + sub-window lexicon decoder.
+- **🔍 Part-of-File Containment Verifier Drawer**: Verify whether any candidate Image, Video clip, Audio excerpt, PDF, or Text passage is contained inside your indexed files with exact timestamps/lines.
+- **⚙️ Folders & Cost Estimator Sheet**: Switch folders, estimate file/chunk counts and indexing time before indexing, or trigger incremental/full indexing.
 
 ### CLI Usage
 ```bash
 # 1. Download & verify EmbeddingGemma 2 GGUF models (~865 MB total)
-./target/release/prism download-model
+prism download-model
 
 # 2. Estimate indexing cost for a directory
-./target/release/prism estimate /path/to/folder
+prism estimate /path/to/folder
 
 # 3. Index a folder (Text, Code, PDFs, Office docs, Images, Audio, Video)
-./target/release/prism index /path/to/folder
+prism index /path/to/folder
 
 # 4. Hybrid text search
-./target/release/prism search "calm alpine mountain lake" -d /path/to/folder
+prism search "calm alpine mountain lake" -d /path/to/folder
 
 # 5. Spoken Audio / Voice search (exploiting 768-D EmbeddingGemma 2 space + Semantic ASR)
-./target/release/prism search --audio speech.wav -d /path/to/folder
+prism search --audio speech.wav -d /path/to/folder
 
 # 6. Standalone 768-D Semantic-Space ASR breakdown
-./target/release/prism asr speech.wav -d /path/to/folder
+prism asr speech.wav -d /path/to/folder
 
 # 7. Verify if an Image, Video, Audio clip, or Text snippet is part of any indexed file
-./target/release/prism contain photo.jpg -d /path/to/folder
-./target/release/prism contain clip.mp4 -d /path/to/folder
-./target/release/prism contain speech.wav -d /path/to/folder
-./target/release/prism contain --text "exact quote or code snippet" -d /path/to/folder
+prism contain photo.jpg -d /path/to/folder
+prism contain clip.mp4 -d /path/to/folder
+prism contain speech.wav -d /path/to/folder
+prism contain --text "exact quote or code snippet" -d /path/to/folder
 ```
 
 ---

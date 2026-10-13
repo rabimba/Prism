@@ -10,25 +10,23 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Prism — Multimodal Search, Semantic ASR & Containment",
+        "title": "Prism",
         "width": 1140,
-        "height": 780,
+        "height": 760,
         "minWidth": 820,
-        "minHeight": 560,
+        "minHeight": 540,
         "resizable": true
       }
     ],
     "security": {
-      "csp": null,
-      "assetProtocol": {
-        "enable": true,
-        "scope": ["**"]
-      }
+      "csp": null
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [
+      "icons/icon.png"
+    ]
   }
 }
