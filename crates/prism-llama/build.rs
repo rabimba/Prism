@@ -37,9 +37,11 @@ fn main() {
     println!("cargo:rerun-if-changed=src/llama_shim.c");
     println!("cargo:rerun-if-changed={}", llama_include.display());
 
+    let llama_lib_quoted = format!("\"{}\"", llama_lib.display());
     cc::Build::new()
         .file("src/llama_shim.c")
         .include(&llama_include)
+        .define("PRISM_LLAMA_LIB_DIR", llama_lib_quoted.as_str())
         .opt_level(3)
         .warnings(false)
         .compile("prism_llama_shim");

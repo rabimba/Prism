@@ -21,6 +21,11 @@ void prism_llama_init_backend(void) {
     if (ggml_backend_dev_count() == 0) {
         ggml_backend_load_all();
     }
+#ifdef PRISM_LLAMA_LIB_DIR
+    if (ggml_backend_dev_count() == 0) {
+        ggml_backend_load_all_from_path(PRISM_LLAMA_LIB_DIR);
+    }
+#endif
     llama_backend_init();
 }
 
